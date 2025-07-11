@@ -33,7 +33,6 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.Offset
-import androidx.compose.ui.geometry.Size as ComposeSize
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.PathEffect
 import androidx.compose.ui.graphics.drawscope.DrawScope
@@ -50,21 +49,17 @@ import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
 import com.example.atry.detector.BitmapUtils
-import com.example.atry.detector.Detection
-import com.example.atry.detector.YOLOv8ObjectDetector
-import com.example.atry.detector.BarPathAnalyzer
+import com.example.atry.detector.EnhancedBarbellTracker
+import com.example.atry.detector.BarbellAnalytics
+import com.example.atry.detector.TrackingResult
 import com.example.atry.detector.ReportGenerator
 import com.example.atry.detector.PathPoint
-import com.example.atry.detector.BarPath
-import com.example.atry.detector.MovementDirection
-import com.example.atry.detector.MovementAnalysis
 import com.example.atry.ui.theme.TryTheme
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.util.concurrent.Executors
-import kotlin.math.abs
 import kotlin.math.sqrt
 
 class MainActivity : ComponentActivity() {
@@ -76,7 +71,7 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        Log.d(TAG, "MainActivity onCreate started")
+        Log.d(TAG, "MainActivity onCreate with Generic TFLite Support")
 
         setContent {
             TryTheme {
@@ -91,7 +86,7 @@ class MainActivity : ComponentActivity() {
     private fun MainContent() {
         val context = LocalContext.current
 
-        // Track permission state more robustly
+        // Track permission state
         var hasCameraPermission by remember {
             mutableStateOf(
                 ContextCompat.checkSelfPermission(
@@ -104,7 +99,7 @@ class MainActivity : ComponentActivity() {
         var permissionRequested by remember { mutableStateOf(false) }
         var permissionDenied by remember { mutableStateOf(false) }
 
-        // Enhanced permission launcher with better error handling
+        // Permission launcher
         val permissionLauncher = rememberLauncherForActivityResult(
             contract = ActivityResultContracts.RequestPermission()
         ) { isGranted ->
@@ -124,7 +119,7 @@ class MainActivity : ComponentActivity() {
         LaunchedEffect(Unit) {
             if (!hasCameraPermission && !permissionRequested) {
                 Log.d(TAG, "Requesting camera permission")
-                delay(300) // Small delay to ensure UI is ready
+                delay(300)
                 permissionLauncher.launch(Manifest.permission.CAMERA)
             }
         }
@@ -132,8 +127,8 @@ class MainActivity : ComponentActivity() {
         Box(modifier = Modifier.fillMaxSize()) {
             when {
                 hasCameraPermission -> {
-                    Log.d(TAG, "Camera permission granted, showing camera preview")
-                    CameraPreviewWithYOLOv11()
+                    Log.d(TAG, "Camera permission granted, showing generic camera preview")
+                    GenericCameraPreview()
                 }
                 permissionDenied -> {
                     PermissionDeniedScreen {
@@ -146,6 +141,648 @@ class MainActivity : ComponentActivity() {
                         permissionLauncher.launch(Manifest.permission.CAMERA)
                     }
                 }
+            }
+        }
+    }
+
+    @Composable
+    private fun GenericCameraPreview() {
+        val context = LocalContext.current
+        val lifecycleOwner = LocalLifecycleOwner.current
+        val scope = rememberCoroutineScope()
+
+        Log.d("GenericCamera", "Initializing Generic TFLite barbell tracker")
+
+        // Create enhanced tracker with generic TFLite support
+        val tracker = remember {
+            try {
+                Log.d("GenericCamera", "Creating Enhanced Tracker with Generic TFLite support")
+                EnhancedBarbellTracker(
+                    context = context,
+                    modelPath = "simonskina.tflite", // Your model
+                    confThreshold = 0.3f,  // Lower threshold for generic models
+                    iouThreshold = 0.5f,
+                    maxAge = 30
+                )
+            } catch (e: Exception) {
+                Log.e("GenericCamera", "Failed to create Enhanced Tracker: ${e.message}", e)
+                null
+            }
+        }
+
+        // Create report generator
+        val reportGenerator = remember { ReportGenerator(context) }
+
+        if (tracker == null) {
+            Box(
+                modifier = Modifier.fillMaxSize(),
+                contentAlignment = Alignment.Center
+            ) {
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    Text(
+                        text = "⚠️ Generic Tracker Loading Failed",
+                        color = Color.Red,
+                        fontSize = 18.sp,
+                        fontWeight = FontWeight.Bold
+                    )
+                    Text(
+                        text = "Please check if simonskina.tflite is in assets folder and is a valid TensorFlow Lite model",
+                        color = Color.Gray,
+                        fontSize = 14.sp,
+                        textAlign = TextAlign.Center,
+                        modifier = Modifier.padding(16.dp)
+                    )
+
+                    Button(
+                        onClick = {
+                            // Try to provide debug info
+                            try {
+                                val inputStream = context.assets.open("simonskina.tflite")
+                                val size = inputStream.available()
+                                inputStream.close()
+                                Toast.makeText(context, "Model found: ${size} bytes", Toast.LENGTH_LONG).show()
+                            } catch (e: Exception) {
+                                Toast.makeText(context, "Model not found: ${e.message}", Toast.LENGTH_LONG).show()
+                            }
+                        }
+                    ) {
+                        Text("Check Model")
+                    }
+                }
+            }
+            return
+        }
+
+        // PreviewView instance
+        val previewView = remember { PreviewView(context) }
+
+        // Enhanced state variables
+        var trackingResult by remember { mutableStateOf<TrackingResult?>(null) }
+        var isProcessing by remember { mutableStateOf(false) }
+        var fps by remember { mutableStateOf(0f) }
+        var cameraError by remember { mutableStateOf<String?>(null) }
+        var analytics by remember { mutableStateOf<BarbellAnalytics?>(null) }
+
+        // Session management
+        var isRecording by remember { mutableStateOf(false) }
+        var sessionStartTime by remember { mutableStateOf(0L) }
+        var sessionEndTime by remember { mutableStateOf(0L) }
+        var isGeneratingReport by remember { mutableStateOf(false) }
+
+        // FPS calculation
+        var frameCount by remember { mutableStateOf(0) }
+        var lastFpsUpdate by remember { mutableStateOf(System.currentTimeMillis()) }
+
+        // Dispose tracker when composable is removed
+        DisposableEffect(tracker) {
+            onDispose {
+                try {
+                    tracker.cleanup()
+                    Log.d("GenericCamera", "Generic tracker cleaned up successfully")
+                } catch (e: Exception) {
+                    Log.e("GenericCamera", "Error cleaning up tracker: ${e.message}", e)
+                }
+            }
+        }
+
+        // Generic Camera setup for any TFLite model
+        LaunchedEffect(previewView) {
+            try {
+                Log.d("GenericCamera", "Generic camera setup with TFLite support")
+                val cameraProvider = ProcessCameraProvider.getInstance(context).get()
+
+                val preview = Preview.Builder().build().also {
+                    it.setSurfaceProvider(previewView.surfaceProvider)
+                }
+
+                val imageAnalysis = androidx.camera.core.ImageAnalysis.Builder()
+                    .setBackpressureStrategy(androidx.camera.core.ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+                    .setTargetResolution(Size(640, 480)) // Good resolution for most models
+                    .setOutputImageFormat(androidx.camera.core.ImageAnalysis.OUTPUT_IMAGE_FORMAT_YUV_420_888)
+                    .build()
+                    .also { analyzer ->
+                        analyzer.setAnalyzer(Executors.newSingleThreadExecutor()) { imageProxy ->
+                            if (isProcessing) {
+                                imageProxy.close()
+                                return@setAnalyzer
+                            }
+
+                            isProcessing = true
+
+                            scope.launch(Dispatchers.Default) {
+                                try {
+                                    val bitmap = BitmapUtils.imageProxyToBitmap(imageProxy)
+                                    val timestamp = System.currentTimeMillis()
+
+                                    // Use generic tracking
+                                    val newTrackingResult = tracker.track(bitmap, timestamp)
+
+                                    withContext(Dispatchers.Main) {
+                                        trackingResult = newTrackingResult
+
+                                        // Generic logging for tracking results
+                                        if (newTrackingResult.trackedObjects.isNotEmpty()) {
+                                            Log.d("GenericCamera", "Generic tracker found ${newTrackingResult.trackedObjects.size} tracked objects")
+                                            newTrackingResult.trackedObjects.forEachIndexed { index, obj ->
+                                                Log.d("GenericCamera", "Tracked Object $index: " +
+                                                        "ID=${obj.id}, " +
+                                                        "conf=${String.format("%.3f", obj.confidence)}, " +
+                                                        "center=[${String.format("%.3f", obj.center.first)}, " +
+                                                        "${String.format("%.3f", obj.center.second)}]")
+                                            }
+                                        }
+
+                                        // Update analytics if recording
+                                        if (isRecording) {
+                                            analytics = tracker.getAnalytics()
+                                        }
+                                    }
+
+                                    // FPS calculation
+                                    frameCount++
+                                    val currentTime = System.currentTimeMillis()
+                                    if (currentTime - lastFpsUpdate >= 1500) {
+                                        val newFps = frameCount * 1000f / (currentTime - lastFpsUpdate)
+                                        withContext(Dispatchers.Main) {
+                                            fps = newFps
+                                        }
+                                        frameCount = 0
+                                        lastFpsUpdate = currentTime
+                                    }
+
+                                } catch (e: Exception) {
+                                    Log.e("GenericCamera", "Generic tracking error: ${e.message}")
+                                } finally {
+                                    isProcessing = false
+                                    imageProxy.close()
+                                }
+                            }
+                        }
+                    }
+
+                // Bind camera
+                cameraProvider.unbindAll()
+                cameraProvider.bindToLifecycle(
+                    lifecycleOwner,
+                    CameraSelector.DEFAULT_BACK_CAMERA,
+                    preview,
+                    imageAnalysis
+                )
+
+                Log.d("GenericCamera", "Generic camera setup complete")
+                cameraError = null
+
+            } catch (e: Exception) {
+                val errorMsg = "Generic camera setup failed: ${e.message}"
+                Log.e("GenericCamera", errorMsg, e)
+                cameraError = errorMsg
+            }
+        }
+
+        // UI Layout
+        Box(modifier = Modifier.fillMaxSize()) {
+            if (cameraError != null) {
+                // Show error state
+                Box(
+                    modifier = Modifier.fillMaxSize(),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                        Text(
+                            text = "📷 Generic Camera Error",
+                            color = Color.Red,
+                            fontSize = 18.sp,
+                            fontWeight = FontWeight.Bold
+                        )
+                        Spacer(modifier = Modifier.height(8.dp))
+                        Text(
+                            text = cameraError!!,
+                            color = Color.Gray,
+                            fontSize = 12.sp,
+                            textAlign = TextAlign.Center,
+                            modifier = Modifier.padding(16.dp)
+                        )
+                        Button(
+                            onClick = { cameraError = null }
+                        ) {
+                            Text("Retry")
+                        }
+                    }
+                }
+            } else {
+                // Camera Preview
+                AndroidView(
+                    factory = { previewView },
+                    modifier = Modifier.fillMaxSize()
+                )
+
+                // Generic Detection and Path Overlay
+                Canvas(modifier = Modifier.fillMaxSize()) {
+                    trackingResult?.let { result ->
+                        drawGenericTracking(result)
+                    }
+                }
+
+                // Generic Info Panel
+                GenericTrackingInfoPanel(
+                    trackingResult = trackingResult,
+                    analytics = analytics,
+                    fps = fps,
+                    isProcessing = isProcessing,
+                    isRecording = isRecording,
+                    isGeneratingReport = isGeneratingReport,
+                    onStartStopRecording = {
+                        isRecording = !isRecording
+                        Log.d("GenericCamera", "Generic recording toggled - isRecording: $isRecording")
+                        if (isRecording) {
+                            tracker.reset() // Clear previous tracking data
+                            sessionStartTime = System.currentTimeMillis()
+                            Log.d("GenericCamera", "Started generic recording - reset tracker")
+                        } else {
+                            sessionEndTime = System.currentTimeMillis()
+                            analytics = tracker.getAnalytics()
+                            Log.d("GenericCamera", "Stopped generic recording")
+                        }
+                    },
+                    onClearTracking = {
+                        tracker.reset()
+                        analytics = null
+                        Log.d("GenericCamera", "Cleared all generic tracking data")
+                    },
+                    onGenerateExcelReport = {
+                        scope.launch {
+                            isGeneratingReport = true
+                            try {
+                                val trackingData = tracker.getTrackingData()
+                                val session = ReportGenerator.WorkoutSession(
+                                    startTime = sessionStartTime,
+                                    endTime = if (sessionEndTime > 0) sessionEndTime else System.currentTimeMillis(),
+                                    actualRepCount = analytics?.repCount ?: 0,
+                                    paths = convertTrackingDataToPaths(trackingData),
+                                    movements = emptyList()
+                                )
+
+                                val result = reportGenerator.generateExcelReport(session,
+                                    com.example.atry.detector.BarPathAnalyzer())
+                                result.fold(
+                                    onSuccess = { file ->
+                                        Toast.makeText(context, "Generic Excel report generated: ${file.name}", Toast.LENGTH_LONG).show()
+                                        reportGenerator.shareReport(file)
+                                    },
+                                    onFailure = { error ->
+                                        Toast.makeText(context, "Error generating generic Excel report: ${error.message}", Toast.LENGTH_LONG).show()
+                                        Log.e("GenericCamera", "Generic Excel report error", error)
+                                    }
+                                )
+                            } finally {
+                                isGeneratingReport = false
+                            }
+                        }
+                    },
+                    onGenerateCSVReport = {
+                        scope.launch {
+                            isGeneratingReport = true
+                            try {
+                                val trackingData = tracker.getTrackingData()
+                                val session = ReportGenerator.WorkoutSession(
+                                    startTime = sessionStartTime,
+                                    endTime = if (sessionEndTime > 0) sessionEndTime else System.currentTimeMillis(),
+                                    actualRepCount = analytics?.repCount ?: 0,
+                                    paths = convertTrackingDataToPaths(trackingData),
+                                    movements = emptyList()
+                                )
+
+                                val result = reportGenerator.generateCSVReport(session,
+                                    com.example.atry.detector.BarPathAnalyzer())
+                                result.fold(
+                                    onSuccess = { file ->
+                                        Toast.makeText(context, "Generic CSV report generated: ${file.name}", Toast.LENGTH_LONG).show()
+                                        reportGenerator.shareReport(file)
+                                    },
+                                    onFailure = { error ->
+                                        Toast.makeText(context, "Error generating generic CSV report: ${error.message}", Toast.LENGTH_LONG).show()
+                                        Log.e("GenericCamera", "Generic CSV report error", error)
+                                    }
+                                )
+                            } finally {
+                                isGeneratingReport = false
+                            }
+                        }
+                    },
+                    modifier = Modifier.align(Alignment.TopStart)
+                )
+            }
+        }
+    }
+
+    // Helper function to convert tracking data to BarPath objects
+    private fun convertTrackingDataToPaths(trackingData: List<EnhancedBarbellTracker.TrackingDataPoint>): List<com.example.atry.detector.BarPath> {
+        val groupedData = trackingData.groupBy { it.id }
+        return groupedData.map { (id, points) ->
+            val barPath = com.example.atry.detector.BarPath(id = "generic_path_$id")
+            points.forEach { dataPoint ->
+                barPath.addPoint(PathPoint(dataPoint.x, dataPoint.y, dataPoint.timestamp))
+            }
+            barPath
+        }
+    }
+}
+
+// Generic drawing function for any TFLite model tracking
+private fun DrawScope.drawGenericTracking(result: TrackingResult) {
+    val canvasWidth = size.width
+    val canvasHeight = size.height
+
+    // Draw tracked objects with generic visualization
+    result.trackedObjects.forEach { obj ->
+        val bbox = obj.bbox
+        val left = bbox.left * canvasWidth
+        val top = bbox.top * canvasHeight
+        val right = bbox.right * canvasWidth
+        val bottom = bbox.bottom * canvasHeight
+
+        // Color based on tracking ID for consistency
+        val colors = listOf(
+            Color.Cyan, Color.Yellow, Color.Magenta,
+            Color.Green, Color.Blue, Color.Red
+        )
+        val color = colors[obj.id % colors.size]
+
+        // Draw bounding box
+        val strokeWidth = 3.dp.toPx()
+        drawRect(
+            color = color,
+            topLeft = Offset(left, top),
+            size = androidx.compose.ui.geometry.Size(right - left, bottom - top),
+            style = Stroke(width = strokeWidth)
+        )
+
+        // Draw tracking ID and confidence
+        drawContext.canvas.nativeCanvas.apply {
+            val paint = android.graphics.Paint().apply {
+                this.color = color.toArgb()
+                textSize = 14.sp.toPx()
+                isAntiAlias = true
+                isFakeBoldText = true
+            }
+
+            val label = "ID: ${obj.id}"
+            val confText = "Conf: ${String.format("%.2f", obj.confidence)}"
+
+            drawText(label, left + 5f, top - 5f, paint)
+            drawText(confText, left + 5f, top - 25f, paint)
+        }
+
+        // Draw center point
+        val centerX = obj.center.first * canvasWidth
+        val centerY = obj.center.second * canvasHeight
+        drawCircle(
+            color = color,
+            radius = 6.dp.toPx(),
+            center = Offset(centerX, centerY)
+        )
+    }
+
+    // Draw bar paths with generic visualization
+    result.barPaths.forEach { (trackingId, pathPoints) ->
+        if (pathPoints.size < 2) return@forEach
+
+        val color = when (trackingId % 6) {
+            0 -> Color.Cyan
+            1 -> Color.Yellow
+            2 -> Color.Magenta
+            3 -> Color.Green
+            4 -> Color.Blue
+            else -> Color.Red
+        }
+
+        // Draw path lines
+        pathPoints.zipWithNext { a, b ->
+            drawLine(
+                color = color,
+                start = Offset(a.x * canvasWidth, a.y * canvasHeight),
+                end = Offset(b.x * canvasWidth, b.y * canvasHeight),
+                strokeWidth = 2.dp.toPx()
+            )
+        }
+
+        // Draw recent points
+        pathPoints.takeLast(5).forEach { point ->
+            drawCircle(
+                color = color,
+                radius = 3.dp.toPx(),
+                center = Offset(point.x * canvasWidth, point.y * canvasHeight)
+            )
+        }
+
+        // Highlight the most recent point
+        if (pathPoints.isNotEmpty()) {
+            val lastPoint = pathPoints.last()
+            drawCircle(
+                color = Color.White,
+                radius = 5.dp.toPx(),
+                center = Offset(lastPoint.x * canvasWidth, lastPoint.y * canvasHeight),
+                style = Stroke(width = 2.dp.toPx())
+            )
+        }
+    }
+}
+
+@Composable
+private fun GenericTrackingInfoPanel(
+    trackingResult: TrackingResult?,
+    analytics: BarbellAnalytics?,
+    fps: Float,
+    isProcessing: Boolean,
+    isRecording: Boolean,
+    isGeneratingReport: Boolean,
+    onStartStopRecording: () -> Unit,
+    onClearTracking: () -> Unit,
+    onGenerateExcelReport: () -> Unit,
+    onGenerateCSVReport: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    Box(
+        modifier = modifier
+            .fillMaxWidth()
+            .padding(top = 60.dp)
+    ) {
+        Column(
+            modifier = Modifier.align(Alignment.TopCenter),
+            verticalArrangement = Arrangement.Center,
+            horizontalAlignment = Alignment.CenterHorizontally
+        ) {
+            Text(
+                text = "Generic TFLite Barbell Tracker",
+                color = Color.White,
+                fontSize = 16.sp,
+                fontWeight = FontWeight.Bold,
+                textAlign = TextAlign.Center
+            )
+            Text(
+                text = "Model: simonskina.tflite",
+                color = Color.Cyan,
+                fontSize = 12.sp,
+                textAlign = TextAlign.Center
+            )
+            Spacer(modifier = Modifier.height(4.dp))
+
+            // Control buttons
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                modifier = Modifier.padding(horizontal = 8.dp)
+            ) {
+                Button(
+                    onClick = onStartStopRecording,
+                    modifier = Modifier.height(28.dp),
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = if (isRecording) Color.Red else Color.Green
+                    )
+                ) {
+                    Text(
+                        text = if (isRecording) "Stop" else "Start",
+                        fontSize = 10.sp,
+                        color = Color.White
+                    )
+                }
+                Button(
+                    onClick = onClearTracking,
+                    modifier = Modifier.height(28.dp),
+                    colors = ButtonDefaults.buttonColors(containerColor = Color.Blue)
+                ) {
+                    Text("Clear", fontSize = 10.sp, color = Color.White)
+                }
+            }
+
+            Spacer(modifier = Modifier.height(4.dp))
+
+            // Report generation buttons
+            AnimatedVisibility(visible = analytics?.repCount ?: 0 > 0) {
+                Row(
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    modifier = Modifier.padding(horizontal = 8.dp)
+                ) {
+                    Button(
+                        onClick = onGenerateExcelReport,
+                        enabled = !isGeneratingReport && (analytics?.repCount ?: 0) > 0,
+                        modifier = Modifier.height(28.dp),
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = Color(0xFF007ACC),
+                            disabledContainerColor = Color.Gray
+                        )
+                    ) {
+                        Text(
+                            text = if (isGeneratingReport) "..." else "📊 Excel",
+                            fontSize = 10.sp,
+                            color = Color.White
+                        )
+                    }
+                    Button(
+                        onClick = onGenerateCSVReport,
+                        enabled = !isGeneratingReport && (analytics?.repCount ?: 0) > 0,
+                        modifier = Modifier.height(28.dp),
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = Color(0xFF228B22),
+                            disabledContainerColor = Color.Gray
+                        )
+                    ) {
+                        Text(
+                            text = if (isGeneratingReport) "..." else "📋 CSV",
+                            fontSize = 10.sp,
+                            color = Color.White
+                        )
+                    }
+                }
+            }
+
+            Spacer(modifier = Modifier.height(6.dp))
+
+            // Status info
+            Text(
+                text = "FPS: ${String.format("%.1f", fps)}",
+                color = Color.White,
+                fontSize = 11.sp,
+                textAlign = TextAlign.Center
+            )
+            Text(
+                text = "Tracked Objects: ${trackingResult?.trackedObjects?.size ?: 0}",
+                color = Color.White,
+                fontSize = 11.sp,
+                textAlign = TextAlign.Center
+            )
+            Text(
+                text = "Active Paths: ${trackingResult?.barPaths?.size ?: 0}",
+                color = Color.Cyan,
+                fontSize = 11.sp,
+                textAlign = TextAlign.Center
+            )
+            Text(
+                text = "Recording: ${if (isRecording) "ON" else "OFF"}",
+                color = if (isRecording) Color.Green else Color.Gray,
+                fontSize = 11.sp,
+                fontWeight = FontWeight.Bold,
+                textAlign = TextAlign.Center
+            )
+
+            // Analytics display
+            analytics?.let { stats ->
+                Spacer(modifier = Modifier.height(4.dp))
+                Text(
+                    text = "Reps: ${stats.repCount}",
+                    color = Color.Cyan,
+                    fontSize = 13.sp,
+                    fontWeight = FontWeight.Bold,
+                    textAlign = TextAlign.Center
+                )
+                if (stats.totalDistance > 0) {
+                    Text(
+                        text = "Distance: ${String.format("%.2f", stats.totalDistance)}",
+                        color = Color.Yellow,
+                        fontSize = 11.sp,
+                        textAlign = TextAlign.Center
+                    )
+                    Text(
+                        text = "Avg Speed: ${String.format("%.2f", stats.averageVelocity)}",
+                        color = Color.Yellow,
+                        fontSize = 11.sp,
+                        textAlign = TextAlign.Center
+                    )
+                    Text(
+                        text = "Consistency: ${String.format("%.1f%%", stats.pathConsistency * 100)}",
+                        color = Color.Green,
+                        fontSize = 11.sp,
+                        textAlign = TextAlign.Center
+                    )
+                }
+                stats.primaryTrackingId?.let { id ->
+                    Text(
+                        text = "Primary ID: $id",
+                        color = Color.Magenta,
+                        fontSize = 10.sp,
+                        textAlign = TextAlign.Center
+                    )
+                }
+            }
+
+            if (isGeneratingReport) {
+                Text(
+                    text = "📄 Generating Generic Report...",
+                    color = Color.Yellow,
+                    fontSize = 11.sp,
+                    fontWeight = FontWeight.Bold,
+                    textAlign = TextAlign.Center
+                )
+            }
+
+            // Display tracked objects info
+            trackingResult?.trackedObjects?.take(2)?.forEachIndexed { index, obj ->
+                Spacer(modifier = Modifier.height(4.dp))
+                Text(
+                    text = "ID ${obj.id}: ${String.format("%.2f", obj.confidence)}",
+                    color = Color.Cyan,
+                    fontSize = 9.sp,
+                    textAlign = TextAlign.Center
+                )
             }
         }
     }
@@ -186,7 +823,7 @@ private fun PermissionRequestScreen(onRequest: () -> Unit) {
             )
             Spacer(modifier = Modifier.height(8.dp))
             Text(
-                text = "This app needs camera access to detect barbells",
+                text = "Generic TFLite tracking needs camera access",
                 style = MaterialTheme.typography.bodyMedium,
                 color = Color.Gray,
                 textAlign = TextAlign.Center
@@ -235,7 +872,7 @@ private fun PermissionDeniedScreen(onRetry: () -> Unit) {
             )
             Spacer(modifier = Modifier.height(8.dp))
             Text(
-                text = "Please grant camera permission in Settings or tap below to try again",
+                text = "Generic tracking requires camera permission. Please grant permission in Settings or try again.",
                 style = MaterialTheme.typography.bodyMedium,
                 color = Color.Gray,
                 textAlign = TextAlign.Center,
@@ -252,724 +889,6 @@ private fun PermissionDeniedScreen(onRetry: () -> Unit) {
                     color = Color.White,
                     fontWeight = FontWeight.Bold
                 )
-            }
-        }
-    }
-}
-
-@Composable
-private fun CameraPreviewWithYOLOv11() {
-    val context = LocalContext.current
-    val lifecycleOwner = LocalLifecycleOwner.current
-    val scope = rememberCoroutineScope()
-
-    Log.d("CameraPreview", "Initializing camera preview")
-
-    // Create detector with FIXED parameters (removed iouThreshold)
-    val detector = remember {
-        try {
-            Log.d("CameraPreview", "Creating YOLOv8 detector based on working YOLOv11 logic")
-            YOLOv8ObjectDetector(
-                context = context,
-                modelPath = "yolofinal.tflite", // Your trained YOLOv8 model
-                confThreshold = 0.1f,  // Start with low threshold for debugging
-                iouThreshold = 0.3f,   // Same as working YOLOv11
-                inputSize = 320        // Match your training size
-            )
-        } catch (e: Exception) {
-            Log.e("CameraPreview", "Failed to create YOLOv8 detector: ${e.message}", e)
-            Toast.makeText(context, "Failed to load YOLOv8 model: ${e.message}", Toast.LENGTH_LONG).show()
-            null
-        }
-    }
-    // Create analyzer and report generator
-    val analyzer = remember { BarPathAnalyzer() }
-    val reportGenerator = remember { ReportGenerator(context) }
-
-    // Early return if detector creation failed
-    if (detector == null) {
-        Box(
-            modifier = Modifier.fillMaxSize(),
-            contentAlignment = Alignment.Center
-        ) {
-            Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                Text(
-                    text = "⚠️ Model Loading Failed",
-                    color = Color.Red,
-                    fontSize = 18.sp,
-                    fontWeight = FontWeight.Bold
-                )
-                Text(
-                    text = "Check if new model.tflite is in assets folder",
-                    color = Color.Gray,
-                    fontSize = 14.sp,
-                    textAlign = TextAlign.Center
-                )
-            }
-        }
-        return
-    }
-
-    // PreviewView instance
-    val previewView = remember { PreviewView(context) }
-
-    // State variables
-    var detections by remember { mutableStateOf<List<Detection>>(emptyList()) }
-    var isProcessing by remember { mutableStateOf(false) }
-    var fps by remember { mutableStateOf(0f) }
-    var cameraError by remember { mutableStateOf<String?>(null) }
-
-    // Enhanced bar path tracking state with session management
-    var barPaths by remember { mutableStateOf<List<BarPath>>(listOf(BarPath())) }
-    var currentMovement by remember { mutableStateOf<MovementAnalysis?>(null) }
-    var repCount by remember { mutableStateOf(0) }
-    var isRecording by remember { mutableStateOf(false) }
-
-    // Session management state
-    var sessionStartTime by remember { mutableStateOf(0L) }
-    var sessionEndTime by remember { mutableStateOf(0L) }
-    var allMovements by remember { mutableStateOf<List<MovementAnalysis>>(emptyList()) }
-    var isGeneratingReport by remember { mutableStateOf(false) }
-
-    // FPS calculation
-    var frameCount by remember { mutableStateOf(0) }
-    var lastFpsUpdate by remember { mutableStateOf(System.currentTimeMillis()) }
-
-    // Performance optimization variables
-    var frameSkipCounter by remember { mutableStateOf(0) }
-
-    // Dispose detector when composable is removed
-    DisposableEffect(detector) {
-        onDispose {
-            try {
-                detector.cleanup()
-                detector.close()
-                Log.d("CameraPreview", "Detector closed successfully")
-            } catch (e: Exception) {
-                Log.e("CameraPreview", "Error closing detector: ${e.message}", e)
-            }
-        }
-    }
-
-    // EXTREME Camera setup for Redmi 13C
-    LaunchedEffect(previewView) {
-        try {
-            Log.d("CameraPreview", "YOLOv8 camera setup for Redmi 13C")
-            val cameraProvider = ProcessCameraProvider.getInstance(context).get()
-
-            val preview = Preview.Builder()
-                .build()
-                .also {
-                    it.setSurfaceProvider(previewView.surfaceProvider)
-                }
-
-            val imageAnalysis = androidx.camera.core.ImageAnalysis.Builder()
-                .setBackpressureStrategy(androidx.camera.core.ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
-                // YOLOv8 optimized resolution
-                .setTargetResolution(Size(480, 320)) // 3:2 aspect ratio works well with YOLOv8
-                .setOutputImageFormat(androidx.camera.core.ImageAnalysis.OUTPUT_IMAGE_FORMAT_YUV_420_888)
-                .build()
-                .also { analyzer ->
-                    analyzer.setAnalyzer(Executors.newSingleThreadExecutor()) { imageProxy ->
-                        // YOLOv8 frame skipping - every 2nd frame (YOLOv8 is more efficient)
-                        frameSkipCounter++
-                        if (frameSkipCounter % 2 != 0) {
-                            imageProxy.close()
-                            return@setAnalyzer
-                        }
-
-                        if (isProcessing) {
-                            imageProxy.close()
-                            return@setAnalyzer
-                        }
-
-                        isProcessing = true
-
-                        scope.launch(Dispatchers.Default) {
-                            try {
-                                val bitmap = BitmapUtils.imageProxyToBitmap(imageProxy)
-                                val newDetections = detector.detect(bitmap)
-
-                                withContext(Dispatchers.Main) {
-                                    detections = newDetections
-
-                                    // Enhanced logging for YOLOv8
-                                    if (newDetections.isNotEmpty()) {
-                                        Log.d("CameraPreview", "YOLOv8 found ${newDetections.size} detections")
-                                        newDetections.forEachIndexed { index, detection ->
-                                            Log.d("CameraPreview", "Detection $index: " +
-                                                    "conf=${String.format("%.3f", detection.score)}, " +
-                                                    "class=${detector.getClassLabel(detection.classId)}, " +
-                                                    "bbox=[${String.format("%.3f", detection.bbox.left)}, " +
-                                                    "${String.format("%.3f", detection.bbox.top)}, " +
-                                                    "${String.format("%.3f", detection.bbox.right)}, " +
-                                                    "${String.format("%.3f", detection.bbox.bottom)}]")
-                                        }
-                                    }
-                                }
-
-                                // YOLOv8 optimized bar path processing
-                                if (isRecording && newDetections.isNotEmpty()) {
-                                    val updatedData = processBarPathYOLOv8(
-                                        detections = newDetections,
-                                        currentPaths = barPaths
-                                    )
-
-                                    withContext(Dispatchers.Main) {
-                                        barPaths = updatedData.paths
-                                        repCount = updatedData.repCount
-                                    }
-                                }
-
-                                // FPS calculation
-                                frameCount++
-                                val currentTime = System.currentTimeMillis()
-                                if (currentTime - lastFpsUpdate >= 1500) { // Update every 1.5 seconds
-                                    val newFps = frameCount * 1000f / (currentTime - lastFpsUpdate)
-                                    withContext(Dispatchers.Main) {
-                                        fps = newFps
-                                    }
-                                    frameCount = 0
-                                    lastFpsUpdate = currentTime
-                                }
-
-                            } catch (e: Exception) {
-                                Log.e("CameraPreview", "YOLOv8 processing error: ${e.message}")
-                            } finally {
-                                isProcessing = false
-                                imageProxy.close()
-                            }
-                        }
-                    }
-                }
-
-            // Bind camera
-            cameraProvider.unbindAll()
-            cameraProvider.bindToLifecycle(
-                lifecycleOwner,
-                CameraSelector.DEFAULT_BACK_CAMERA,
-                preview,
-                imageAnalysis
-            )
-
-            Log.d("CameraPreview", "YOLOv8 camera setup complete")
-            cameraError = null
-
-        } catch (e: Exception) {
-            val errorMsg = "YOLOv8 camera setup failed: ${e.message}"
-            Log.e("CameraPreview", errorMsg, e)
-            cameraError = errorMsg
-        }
-    }
-
-    // UI Layout
-    Box(modifier = Modifier.fillMaxSize()) {
-        if (cameraError != null) {
-            // Show error state
-            Box(
-                modifier = Modifier.fillMaxSize(),
-                contentAlignment = Alignment.Center
-            ) {
-                Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                    Text(
-                        text = "📷 Camera Error",
-                        color = Color.Red,
-                        fontSize = 18.sp,
-                        fontWeight = FontWeight.Bold
-                    )
-                    Spacer(modifier = Modifier.height(8.dp))
-                    Text(
-                        text = cameraError!!,
-                        color = Color.Gray,
-                        fontSize = 12.sp,
-                        textAlign = TextAlign.Center,
-                        modifier = Modifier.padding(16.dp)
-                    )
-                    Button(
-                        onClick = {
-                            cameraError = null
-                        }
-                    ) {
-                        Text("Retry")
-                    }
-                }
-            }
-        } else {
-            // Camera Preview
-            AndroidView(
-                factory = { previewView },
-                modifier = Modifier.fillMaxSize()
-            )
-
-            // Detection and Path Overlay
-            Canvas(modifier = Modifier.fillMaxSize()) {
-                // Use YOLOv8 optimized drawing
-                drawDetectionsYOLOv8(detections, detector)
-                drawBarPathsMinimal(barPaths)
-            }
-
-            // Enhanced Info Panel
-            EnhancedInfoPanel(
-                detections = detections,
-                fps = fps,
-                isProcessing = isProcessing,
-                currentMovement = currentMovement,
-                repCount = repCount,
-                isRecording = isRecording,
-                isGeneratingReport = isGeneratingReport,
-                isUsingGPU = false,
-                performanceInfo = detector.getPerformanceInfo(),
-                onStartStopRecording = {
-                    isRecording = !isRecording
-                    Log.d("CameraPreview", "Recording toggled - isRecording: $isRecording")
-                    if (isRecording) {
-                        // Start fresh when recording starts
-                        barPaths = listOf(BarPath())
-                        repCount = 0
-                        allMovements = emptyList()
-                        sessionStartTime = System.currentTimeMillis()
-                        Log.d("CameraPreview", "Started recording - cleared paths")
-                    } else {
-                        sessionEndTime = System.currentTimeMillis()
-                        Log.d("CameraPreview", "Stopped recording")
-                    }
-                },
-                onClearPath = {
-                    barPaths = listOf(BarPath())
-                    repCount = 0
-                    currentMovement = null
-                    allMovements = emptyList()
-                    Log.d("CameraPreview", "Cleared all paths")
-                },
-                onGenerateExcelReport = {
-                    scope.launch {
-                        isGeneratingReport = true
-                        try {
-                            val session = ReportGenerator.WorkoutSession(
-                                startTime = sessionStartTime,
-                                endTime = if (sessionEndTime > 0) sessionEndTime else System.currentTimeMillis(),
-                                actualRepCount = repCount,
-                                paths = barPaths,
-                                movements = allMovements
-                            )
-
-                            val result = reportGenerator.generateExcelReport(session, analyzer)
-                            result.fold(
-                                onSuccess = { file ->
-                                    Toast.makeText(context, "Excel report generated: ${file.name}", Toast.LENGTH_LONG).show()
-                                    reportGenerator.shareReport(file)
-                                },
-                                onFailure = { error ->
-                                    Toast.makeText(context, "Error generating Excel report: ${error.message}", Toast.LENGTH_LONG).show()
-                                    Log.e("CameraPreview", "Excel report error", error)
-                                }
-                            )
-                        } finally {
-                            isGeneratingReport = false
-                        }
-                    }
-                },
-                onGenerateCSVReport = {
-                    scope.launch {
-                        isGeneratingReport = true
-                        try {
-                            val session = ReportGenerator.WorkoutSession(
-                                startTime = sessionStartTime,
-                                endTime = if (sessionEndTime > 0) sessionEndTime else System.currentTimeMillis(),
-                                actualRepCount = repCount,
-                                paths = barPaths,
-                                movements = allMovements
-                            )
-
-                            val result = reportGenerator.generateCSVReport(session, analyzer)
-                            result.fold(
-                                onSuccess = { file ->
-                                    Toast.makeText(context, "CSV report generated: ${file.name}", Toast.LENGTH_LONG).show()
-                                    reportGenerator.shareReport(file)
-                                },
-                                onFailure = { error ->
-                                    Toast.makeText(context, "Error generating CSV report: ${error.message}", Toast.LENGTH_LONG).show()
-                                    Log.e("CameraPreview", "CSV report error", error)
-                                }
-                            )
-                        } finally {
-                            isGeneratingReport = false
-                        }
-                    }
-                },
-                modifier = Modifier.align(Alignment.TopStart)
-            )
-        }
-    }
-}
-
-// Data class for bar path processing results
-data class BarPathResult(
-    val paths: List<BarPath>,
-    val movement: MovementAnalysis?,
-    val repCount: Int
-)
-
-// EXTREME bar path processing function
-private fun processBarPathYOLOv8(
-    detections: List<Detection>,
-    currentPaths: List<BarPath>
-): BarPathResult {
-    if (detections.isEmpty()) {
-        return BarPathResult(currentPaths, null, 0)
-    }
-
-    // YOLOv8 usually gives better detections, so use the highest confidence one
-    val bestDetection = detections.maxByOrNull { it.score } ?: detections.first()
-    val centerX = (bestDetection.bbox.left + bestDetection.bbox.right) / 2f
-    val centerY = (bestDetection.bbox.top + bestDetection.bbox.bottom) / 2f
-    val currentTime = System.currentTimeMillis()
-
-    val newPoint = PathPoint(centerX, centerY, currentTime)
-
-    // Get or create active path
-    val activePath = currentPaths.lastOrNull() ?: BarPath()
-
-    // YOLOv8 movement validation (more sensitive due to better accuracy)
-    val shouldAddPoint = if (activePath.points.isEmpty()) {
-        true
-    } else {
-        val lastPoint = activePath.points.last()
-        val dx = newPoint.x - lastPoint.x
-        val dy = newPoint.y - lastPoint.y
-        val distance = kotlin.math.sqrt(dx * dx + dy * dy)
-        distance > 0.008f // More sensitive threshold for YOLOv8
-    }
-
-    if (shouldAddPoint) {
-        activePath.addPoint(newPoint, 150) // Larger buffer for YOLOv8 accuracy
-    }
-
-    // Update paths
-    val updatedPaths = if (currentPaths.isEmpty()) {
-        listOf(activePath)
-    } else {
-        currentPaths.dropLast(1) + activePath
-    }
-
-    // YOLOv8 rep counting (more frequent due to better detection)
-    val repCount = if (activePath.points.size % 10 == 0) { // Every 10th point
-        countRepsYOLOv8(activePath.points)
-    } else {
-        0
-    }
-
-    return BarPathResult(updatedPaths, null, repCount)
-}
-
-// MINIMAL rep counting function
-private fun countRepsYOLOv8(points: List<PathPoint>): Int {
-    if (points.size < 20) return 0
-
-    var repCount = 0
-    var lastDirection: MovementDirection? = null
-    var inUpPhase = false
-    var lastPeakY = 0f
-    var lastValleyY = 0f
-
-    // Use a smoothing window for YOLOv8 data
-    val windowSize = 5
-
-    for (i in windowSize until points.size - windowSize) {
-        // Calculate smoothed Y position
-        val beforeY = points.subList(i - windowSize, i).map { it.y }.average().toFloat()
-        val afterY = points.subList(i + 1, i + windowSize + 1).map { it.y }.average().toFloat()
-        val currentY = points[i].y
-
-        val currentDirection = when {
-            afterY - beforeY > 0.02f -> MovementDirection.DOWN
-            afterY - beforeY < -0.02f -> MovementDirection.UP
-            else -> MovementDirection.STABLE
-        }
-
-        // Enhanced rep detection for YOLOv8
-        when {
-            // Starting upward movement (concentric phase)
-            lastDirection == MovementDirection.DOWN && currentDirection == MovementDirection.UP -> {
-                if (!inUpPhase) {
-                    inUpPhase = true
-                    lastValleyY = currentY
-                }
-            }
-
-            // Completing upward movement, starting downward (eccentric phase)
-            lastDirection == MovementDirection.UP && currentDirection == MovementDirection.DOWN -> {
-                if (inUpPhase) {
-                    lastPeakY = currentY
-                    val rangeOfMotion = kotlin.math.abs(lastPeakY - lastValleyY)
-
-                    // Only count as rep if sufficient range of motion
-                    if (rangeOfMotion > 0.05f) { // 5% of screen height
-                        repCount++
-                        Log.d("YOLOv8RepCount", "Rep detected: ROM=$rangeOfMotion, peak=$lastPeakY, valley=$lastValleyY")
-                    }
-                    inUpPhase = false
-                }
-            }
-        }
-
-        if (currentDirection != MovementDirection.STABLE) {
-            lastDirection = currentDirection
-        }
-    }
-
-    return repCount
-}
-
-
-// MINIMAL drawing functions for maximum performance
-// Replace the drawDetectionsYOLOv8 function in MainActivity.kt with this:
-
-private fun DrawScope.drawDetectionsYOLOv8(detections: List<Detection>, detector: YOLOv8ObjectDetector) {
-    if (detections.isEmpty()) return
-
-    val canvasWidth = size.width
-    val canvasHeight = size.height
-
-    detections.forEach { detection ->
-        val bbox = detection.bbox
-
-        // Convert normalized coordinates to pixel coordinates
-        val left = bbox.left * canvasWidth
-        val top = bbox.top * canvasHeight
-        val right = bbox.right * canvasWidth
-        val bottom = bbox.bottom * canvasHeight
-
-        // Color based on confidence
-        val color = when {
-            detection.score > 0.7f -> androidx.compose.ui.graphics.Color.Green
-            detection.score > 0.4f -> androidx.compose.ui.graphics.Color.Yellow
-            else -> androidx.compose.ui.graphics.Color.Red
-        }
-
-        // Draw bounding box with confidence-based thickness
-        val strokeWidth = (2 + detection.score * 4).dp.toPx()
-
-        drawRect(
-            color = color,
-            topLeft = androidx.compose.ui.geometry.Offset(left, top),
-            size = androidx.compose.ui.geometry.Size(right - left, bottom - top),
-            style = androidx.compose.ui.graphics.drawscope.Stroke(width = strokeWidth)
-        )
-
-        // Draw center point
-        val centerX = (left + right) / 2f
-        val centerY = (top + bottom) / 2f
-
-        drawCircle(
-            color = color,
-            radius = (6 + detection.score * 6).dp.toPx(),
-            center = androidx.compose.ui.geometry.Offset(centerX, centerY)
-        )
-
-        // Draw text info - FIXED VERSION
-        drawContext.canvas.nativeCanvas.apply {
-            val paint = android.graphics.Paint().apply {
-                this.color = color.toArgb()
-                textSize = 14.sp.toPx()
-                isAntiAlias = true
-                isFakeBoldText = true
-            }
-
-            val label = "${detector.getClassLabel(detection.classId)}: ${String.format("%.2f", detection.score)}"
-            // Get quality from detector and show overall quality
-            val quality = detector.getDetectionQuality(detection)
-            val qualityText = "Q: ${String.format("%.2f", quality.getOverallQuality())}"
-
-            drawText(label, left + 5f, top - 5f, paint)
-            drawText(qualityText, left + 5f, top - 25f, paint)
-        }
-    }
-}
-
-private fun DrawScope.drawBarPathsMinimal(paths: List<BarPath>) {
-    if (paths.isEmpty()) return
-
-    val path = paths.first()
-    val canvasWidth = size.width
-    val canvasHeight = size.height
-
-    // Draw only last 5 points for performance
-    val recentPoints = path.points.takeLast(5)
-
-    recentPoints.forEach { point ->
-        val pointX = point.x * canvasWidth
-        val pointY = point.y * canvasHeight
-
-        drawCircle(
-            color = Color.Cyan,
-            radius = 6.dp.toPx(),
-            center = Offset(pointX, pointY)
-        )
-    }
-}
-
-@Composable
-private fun EnhancedInfoPanel(
-    detections: List<Detection>,
-    fps: Float,
-    isProcessing: Boolean,
-    currentMovement: MovementAnalysis?,
-    repCount: Int,
-    isRecording: Boolean,
-    isGeneratingReport: Boolean,
-    isUsingGPU: Boolean = false,
-    performanceInfo: String = "",
-    onStartStopRecording: () -> Unit,
-    onClearPath: () -> Unit,
-    onGenerateExcelReport: () -> Unit,
-    onGenerateCSVReport: () -> Unit,
-    modifier: Modifier = Modifier
-) {
-    Box(
-        modifier = modifier
-            .fillMaxWidth()
-            .padding(top = 60.dp)
-    ) {
-        Column(
-            modifier = Modifier.align(Alignment.TopCenter),
-            verticalArrangement = Arrangement.Center,
-            horizontalAlignment = Alignment.CenterHorizontally
-        ) {
-            Text(
-                text = "Bar Path Detector - YOLOv8",
-                color = Color.White,
-                fontSize = 16.sp,
-                fontWeight = FontWeight.Bold,
-                textAlign = TextAlign.Center
-            )
-            Spacer(modifier = Modifier.height(4.dp))
-
-            // Control buttons row 1
-            Row(
-                horizontalArrangement = Arrangement.spacedBy(6.dp),
-                modifier = Modifier.padding(horizontal = 8.dp)
-            ) {
-                Button(
-                    onClick = onStartStopRecording,
-                    modifier = Modifier.height(28.dp),
-                    colors = ButtonDefaults.buttonColors(
-                        containerColor = if (isRecording) Color.Red else Color.Green
-                    )
-                ) {
-                    Text(
-                        text = if (isRecording) "Stop" else "Start",
-                        fontSize = 10.sp,
-                        color = Color.White
-                    )
-                }
-                Button(
-                    onClick = onClearPath,
-                    modifier = Modifier.height(28.dp),
-                    colors = ButtonDefaults.buttonColors(containerColor = Color.Blue)
-                ) {
-                    Text("Clear", fontSize = 10.sp, color = Color.White)
-                }
-            }
-
-            Spacer(modifier = Modifier.height(4.dp))
-
-            // Report generation buttons row 2
-            AnimatedVisibility(visible = repCount > 0) {
-                Row(
-                    horizontalArrangement = Arrangement.spacedBy(6.dp),
-                    modifier = Modifier.padding(horizontal = 8.dp)
-                ) {
-                    Button(
-                        onClick = onGenerateExcelReport,
-                        enabled = !isGeneratingReport && repCount > 0,
-                        modifier = Modifier.height(28.dp),
-                        colors = ButtonDefaults.buttonColors(
-                            containerColor = Color(0xFF007ACC),
-                            disabledContainerColor = Color.Gray
-                        )
-                    ) {
-                        Text(
-                            text = if (isGeneratingReport) "..." else "📊 Excel",
-                            fontSize = 10.sp,
-                            color = Color.White
-                        )
-                    }
-                    Button(
-                        onClick = onGenerateCSVReport,
-                        enabled = !isGeneratingReport && repCount > 0,
-                        modifier = Modifier.height(28.dp),
-                        colors = ButtonDefaults.buttonColors(
-                            containerColor = Color(0xFF228B22),
-                            disabledContainerColor = Color.Gray
-                        )
-                    ) {
-                        Text(
-                            text = if (isGeneratingReport) "..." else "📋 CSV",
-                            fontSize = 10.sp,
-                            color = Color.White
-                        )
-                    }
-                }
-            }
-
-            Spacer(modifier = Modifier.height(6.dp))
-
-            // Status info
-            Text(
-                text = "FPS: ${String.format("%.1f", fps)}",
-                color = Color.White,
-                fontSize = 11.sp,
-                textAlign = TextAlign.Center
-            )
-            Text(
-                text = performanceInfo,
-                color = Color.Yellow,
-                fontSize = 10.sp,
-                fontWeight = FontWeight.Bold,
-                textAlign = TextAlign.Center
-            )
-            Text(
-                text = "Detections: ${detections.size}",
-                color = Color.White,
-                fontSize = 11.sp,
-                textAlign = TextAlign.Center
-            )
-            Text(
-                text = "Recording: ${if (isRecording) "ON" else "OFF"}",
-                color = if (isRecording) Color.Green else Color.Gray,
-                fontSize = 11.sp,
-                fontWeight = FontWeight.Bold,
-                textAlign = TextAlign.Center
-            )
-            Text(
-                text = "Reps: $repCount",
-                color = Color.Cyan,
-                fontSize = 13.sp,
-                fontWeight = FontWeight.Bold,
-                textAlign = TextAlign.Center
-            )
-
-            if (isGeneratingReport) {
-                Text(
-                    text = "📄 Generating Report...",
-                    color = Color.Yellow,
-                    fontSize = 11.sp,
-                    fontWeight = FontWeight.Bold,
-                    textAlign = TextAlign.Center
-                )
-            }
-
-            if (detections.isNotEmpty()) {
-                Spacer(modifier = Modifier.height(6.dp))
-                detections.take(1).forEachIndexed { index, detection ->
-                    Text(
-                        text = "Barbell: ${String.format("%.2f", detection.score)}",
-                        color = Color.Cyan,
-                        fontSize = 9.sp,
-                        textAlign = TextAlign.Center
-                    )
-                }
             }
         }
     }

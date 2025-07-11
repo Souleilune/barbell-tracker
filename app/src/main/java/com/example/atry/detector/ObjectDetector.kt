@@ -4,96 +4,82 @@ import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.RectF
 import android.util.Log
-import android.widget.Toast
 import org.tensorflow.lite.Interpreter
 import java.io.FileInputStream
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.nio.MappedByteBuffer
 import java.nio.channels.FileChannel
-import kotlin.math.abs
-import kotlin.math.max
-import kotlin.math.min
+import kotlin.math.*
 
 /**
- * Dynamic Threshold Barbell Detector - Automatically finds barbells by adjusting threshold
+ * Generic TensorFlow Lite Object Detector
+ * Works with different model architectures including EfficientDet, MobileNet, etc.
+ * Automatically detects model format and adapts accordingly
  */
-class YOLOv8ObjectDetector(
+class GenericTFLiteDetector(
     private val context: Context,
-    modelPath: String = "yolofinal.tflite",
+    private val modelPath: String = "simonskina.tflite",
     private val inputSize: Int = 320,
-    private var confThreshold: Float = 0.003f, // Start lower to find barbells
-    private val iouThreshold: Float = 0.45f,
-    private val maxDetections: Int = 3
+    private val confThreshold: Float = 0.05f, // Much lower threshold for custom models
+    private val iouThreshold: Float = 0.5f,
+    private val maxDetections: Int = 10
 ) {
 
-    private val classLabels = arrayOf("Barbell")
     private lateinit var interpreter: Interpreter
-
-    private lateinit var outputBuffer: Array<Array<FloatArray>>
-    private var actualOutputShape: IntArray = intArrayOf()
     private var isInitialized = false
 
-    private val inputBuffer = ByteBuffer.allocateDirect(4 * inputSize * inputSize * 3).apply {
-        order(ByteOrder.nativeOrder())
-    }
+    // Model info
+    private var inputTensorIndex = 0
+    private var outputTensorIndex = 0
+    private var inputShape = intArrayOf()
+    private var outputShape = intArrayOf()
+    private var modelType = ModelType.UNKNOWN
+    private var realInputSize = 224 // Will be calculated from actual tensor
 
-    private var frameCount = 0
-    private var realDetectionCount = 0
-    private var lastThresholdAdjustment = 0L
-    private var recentMaxConfidences = mutableListOf<Float>()
+    // Buffers
+    private lateinit var inputBuffer: ByteBuffer
+    private lateinit var outputBuffer: Any
+
+    // Class labels - generic for barbell detection
+    private val classLabels = arrayOf("barbell", "weight", "plate", "object")
 
     companion object {
-        private const val TAG = "DynamicBarbell"
+        private const val TAG = "GenericTFLiteDetector"
 
-        // Edge filtering parameters (same as before)
-        private const val EDGE_MARGIN = 0.1f
-        private const val MIN_CENTER_AREA = 0.03f   // Reduced for smaller barbells
-        private const val MAX_CENTER_AREA = 0.7f
-        private const val MIN_ASPECT_RATIO = 0.2f   // More flexible for barbells
-        private const val MAX_ASPECT_RATIO = 5.0f
-
-        // Dynamic threshold parameters
-        private const val THRESHOLD_STEP = 0.001f
-        private const val MIN_THRESHOLD = 0.001f
-        private const val MAX_THRESHOLD = 0.02f
-        private const val ADJUSTMENT_INTERVAL = 3000L // 3 seconds
+        enum class ModelType {
+            YOLO,           // YOLO format: [batch, num_detections, 85] or similar
+            EFFICIENTDET,   // EfficientDet format: Multiple outputs
+            MOBILENET,      // MobileNet SSD format
+            UNKNOWN
+        }
     }
 
     init {
         try {
-            Log.e(TAG, "🚀 STARTING DYNAMIC BARBELL DETECTOR...")
-            showToast("Dynamic Barbell Detector Starting...")
+            Log.d(TAG, "🚀 Initializing Generic TFLite Detector for: $modelPath")
 
             val options = Interpreter.Options().apply {
                 setNumThreads(4)
                 setUseXNNPACK(true)
+                // Don't use GPU delegate initially - try CPU first
             }
 
             val modelBuffer = loadModelFile(context, modelPath)
             interpreter = Interpreter(modelBuffer, options)
 
+            analyzeModel()
             initializeBuffers()
+
             isInitialized = true
-
-            Log.e(TAG, "✅ DYNAMIC BARBELL DETECTOR READY")
-            Log.e(TAG, "🎯 Will automatically adjust threshold to find barbells")
-            Log.e(TAG, "📍 Starting threshold: $confThreshold")
-
-            showToast("Ready! Point camera at barbell - threshold: $confThreshold")
+            Log.d(TAG, "✅ Generic detector initialized successfully")
+            Log.d(TAG, "📊 Model type: $modelType")
+            Log.d(TAG, "📥 Input shape: ${inputShape.contentToString()}")
+            Log.d(TAG, "📤 Output shape: ${outputShape.contentToString()}")
 
         } catch (e: Exception) {
-            Log.e(TAG, "❌ INITIALIZATION FAILED: ${e.message}", e)
-            showToast("Init failed: ${e.message}")
-            throw RuntimeException("Initialization failed", e)
-        }
-    }
-
-    private fun showToast(message: String) {
-        try {
-            Toast.makeText(context, message, Toast.LENGTH_SHORT).show()
-        } catch (e: Exception) {
-            // Ignore
+            Log.e(TAG, "❌ Failed to initialize Generic TFLite Detector: ${e.message}", e)
+            throw RuntimeException("Failed to initialize detector", e)
         }
     }
 
@@ -106,308 +92,515 @@ class YOLOv8ObjectDetector(
         return fileChannel.map(FileChannel.MapMode.READ_ONLY, startOffset, declaredLength)
     }
 
+    private fun analyzeModel() {
+        try {
+            // Analyze input tensor
+            val inputTensor = interpreter.getInputTensor(inputTensorIndex)
+            inputShape = inputTensor.shape()
+
+            Log.d(TAG, "📊 Analyzing model architecture...")
+            Log.d(TAG, "Input tensor count: ${interpreter.inputTensorCount}")
+            Log.d(TAG, "Output tensor count: ${interpreter.outputTensorCount}")
+
+            // Log input details for debugging
+            Log.d(TAG, "Input shape from tensor: ${inputShape.contentToString()}")
+            Log.d(TAG, "Input data type: ${inputTensor.dataType()}")
+            Log.d(TAG, "Input tensor name: ${inputTensor.name()}")
+
+            // CRITICAL: Get the actual tensor size in bytes, not calculated
+            val actualTensorBytes = try {
+                inputTensor.numBytes()
+            } catch (e: Exception) {
+                Log.w(TAG, "Could not get tensor numBytes, calculating manually")
+                inputShape.fold(1) { acc, dim -> acc * dim } * 4
+            }
+
+            Log.d(TAG, "🔍 Actual tensor expects: $actualTensorBytes bytes")
+
+            // Calculate what size this actually corresponds to
+            val actualInputSize = kotlin.math.sqrt((actualTensorBytes / 4 / 3).toDouble()).toInt() // bytes / 4 (float) / 3 (channels)
+            Log.d(TAG, "🎯 Real input size should be: ${actualInputSize}x$actualInputSize")
+
+            // Analyze all output tensors to determine model type
+            for (i in 0 until interpreter.outputTensorCount) {
+                val outputTensor = interpreter.getOutputTensor(i)
+                val shape = outputTensor.shape()
+                Log.d(TAG, "Output $i shape: ${shape.contentToString()}")
+                Log.d(TAG, "Output $i data type: ${outputTensor.dataType()}")
+                Log.d(TAG, "Output $i name: ${outputTensor.name()}")
+
+                if (i == 0) {
+                    outputShape = shape
+                }
+            }
+
+            // Determine model type based on output shape
+            modelType = when {
+                // YOLO: typically [1, num_detections, 85] or [1, 25200, 85]
+                outputShape.size == 3 && outputShape[2] > 80 -> ModelType.YOLO
+
+                // EfficientDet: typically multiple outputs
+                interpreter.outputTensorCount > 2 -> ModelType.EFFICIENTDET
+
+                // MobileNet SSD: typically [1, num_detections, 4] + [1, num_detections, num_classes]
+                outputShape.size == 3 && outputShape[2] <= 10 -> ModelType.MOBILENET
+
+                else -> ModelType.UNKNOWN
+            }
+
+            Log.d(TAG, "🎯 Detected model type: $modelType")
+
+        } catch (e: Exception) {
+            Log.e(TAG, "Error analyzing model: ${e.message}", e)
+            modelType = ModelType.UNKNOWN
+        }
+    }
+
     private fun initializeBuffers() {
-        val outputTensor = interpreter.getOutputTensor(0)
-        actualOutputShape = outputTensor.shape()
+        // Get the ACTUAL tensor size in bytes directly from TensorFlow Lite
+        val inputTensor = interpreter.getInputTensor(inputTensorIndex)
+        val actualTensorBytes = try {
+            inputTensor.numBytes()
+        } catch (e: Exception) {
+            Log.w(TAG, "Could not get numBytes, using calculated size")
+            inputShape.fold(1) { acc, dim -> acc * dim } * 4
+        }
 
-        val batchSize = actualOutputShape[0]
-        val features = actualOutputShape[1]
-        val detections = actualOutputShape[2]
+        // Calculate the real input dimensions
+        val actualInputSize = kotlin.math.sqrt((actualTensorBytes / 4 / 3).toDouble()).toInt()
 
-        outputBuffer = Array(batchSize) { Array(features) { FloatArray(detections) } }
+        Log.d(TAG, "✅ Using actual tensor size: $actualTensorBytes bytes")
+        Log.d(TAG, "✅ Calculated real input size: ${actualInputSize}x$actualInputSize")
 
-        Log.e(TAG, "✅ Buffers: [$batchSize, $features, $detections]")
+        // Initialize input buffer with ACTUAL size
+        inputBuffer = ByteBuffer.allocateDirect(actualTensorBytes)
+        inputBuffer.order(ByteOrder.nativeOrder())
+
+        Log.d(TAG, "✅ Input buffer allocated: $actualTensorBytes bytes")
+
+        // Store the real input size for preprocessing
+        realInputSize = actualInputSize
+
+        // Initialize output buffer based on model type
+        outputBuffer = when (modelType) {
+            ModelType.YOLO -> {
+                // For YOLO: [batch, detections, features]
+                Array(outputShape[0]) {
+                    Array(outputShape[1]) {
+                        FloatArray(outputShape[2])
+                    }
+                }
+            }
+            ModelType.EFFICIENTDET -> {
+                // For EfficientDet: Multiple outputs, use first one
+                val shape = outputShape
+                Array(shape[0]) { FloatArray(shape[1]) }
+            }
+            ModelType.MOBILENET -> {
+                // For MobileNet: [batch, detections, 4 or classes]
+                Array(outputShape[0]) {
+                    Array(outputShape[1]) {
+                        FloatArray(outputShape[2])
+                    }
+                }
+            }
+            else -> {
+                // Generic fallback - try to handle any shape
+                when (outputShape.size) {
+                    3 -> Array(outputShape[0]) { Array(outputShape[1]) { FloatArray(outputShape[2]) } }
+                    2 -> Array(outputShape[0]) { FloatArray(outputShape[1]) }
+                    1 -> FloatArray(outputShape[0])
+                    else -> Array(outputShape[0]) { FloatArray(outputShape[1]) }
+                }
+            }
+        }
+
+        Log.d(TAG, "✅ Buffers initialized for model type: $modelType")
     }
 
     private fun preprocessImage(bitmap: Bitmap): ByteBuffer {
-        val scaledBitmap = Bitmap.createScaledBitmap(bitmap, inputSize, inputSize, true)
+        // Use the REAL input size calculated from actual tensor bytes
+        val modelInputSize = realInputSize
+
+        Log.d(TAG, "Preprocessing image: ${bitmap.width}x${bitmap.height} -> ${modelInputSize}x$modelInputSize")
+
+        val scaledBitmap = Bitmap.createScaledBitmap(bitmap, modelInputSize, modelInputSize, true)
 
         inputBuffer.clear()
 
-        val pixels = IntArray(inputSize * inputSize)
-        scaledBitmap.getPixels(pixels, 0, inputSize, 0, 0, inputSize, inputSize)
+        val pixels = IntArray(modelInputSize * modelInputSize)
+        scaledBitmap.getPixels(pixels, 0, modelInputSize, 0, 0, modelInputSize, modelInputSize)
 
+        // Check if model expects different channel order
+        val isRGB = true // Most models expect RGB, but some might expect BGR
+
+        // Normalize pixels based on common practices
         for (pixel in pixels) {
             val r = ((pixel shr 16) and 0xFF) / 255.0f
             val g = ((pixel shr 8) and 0xFF) / 255.0f
             val b = (pixel and 0xFF) / 255.0f
 
-            inputBuffer.putFloat(r)
-            inputBuffer.putFloat(g)
-            inputBuffer.putFloat(b)
+            if (isRGB) {
+                inputBuffer.putFloat(r)
+                inputBuffer.putFloat(g)
+                inputBuffer.putFloat(b)
+            } else {
+                // BGR order for some models
+                inputBuffer.putFloat(b)
+                inputBuffer.putFloat(g)
+                inputBuffer.putFloat(r)
+            }
         }
 
         scaledBitmap.recycle()
         inputBuffer.rewind()
 
+        Log.d(TAG, "✅ Image preprocessed: buffer size = ${inputBuffer.capacity()} bytes")
         return inputBuffer
     }
 
     fun detect(bitmap: Bitmap): List<Detection> {
-        if (!isInitialized) return emptyList()
-
-        frameCount++
+        if (!isInitialized) {
+            Log.w(TAG, "Detector not initialized")
+            return emptyList()
+        }
 
         return try {
+            Log.d(TAG, "🔍 Starting detection on ${bitmap.width}x${bitmap.height} bitmap")
+
+            val preprocessStart = System.currentTimeMillis()
             val input = preprocessImage(bitmap)
+            val preprocessTime = System.currentTimeMillis() - preprocessStart
+
+            Log.d(TAG, "✅ Preprocessing completed in ${preprocessTime}ms")
+            Log.d(TAG, "📥 Input buffer size: ${input.capacity()} bytes")
+            Log.d(TAG, "📏 Expected tensor size: ${inputShape.contentToString()}")
+
+            // Debug: Check if buffer size matches tensor expectation
+            // Use the REAL tensor size, not calculated from shape
+            val inputTensor = interpreter.getInputTensor(inputTensorIndex)
+            val expectedBytes = try {
+                inputTensor.numBytes()
+            } catch (e: Exception) {
+                inputShape.fold(1) { acc, dim -> acc * dim } * 4
+            }
+
+            Log.d(TAG, "🔍 Expected bytes: $expectedBytes, Actual bytes: ${input.capacity()}")
+
+            if (input.capacity() != expectedBytes) {
+                Log.e(TAG, "❌ BUFFER SIZE MISMATCH!")
+                Log.e(TAG, "Model expects: $expectedBytes bytes")
+                Log.e(TAG, "We provided: ${input.capacity()} bytes")
+                Log.e(TAG, "Input shape: ${inputShape.contentToString()}")
+                return emptyList()
+            }
+
+            // Run inference
+            val inferenceStart = System.currentTimeMillis()
             interpreter.run(input, outputBuffer)
+            val inferenceTime = System.currentTimeMillis() - inferenceStart
 
-            // Dynamic threshold adjustment
-            dynamicallyAdjustThreshold()
+            Log.d(TAG, "✅ Inference completed in ${inferenceTime}ms")
 
-            val detections = processDetectionsWithFiltering()
+            // Process output based on model type
+            val postprocessStart = System.currentTimeMillis()
+            val detections = when (modelType) {
+                ModelType.YOLO -> processYOLOOutput()
+                ModelType.EFFICIENTDET -> processEfficientDetOutput()
+                ModelType.MOBILENET -> processMobileNetOutput()
+                else -> processGenericOutput()
+            }
+            val postprocessTime = System.currentTimeMillis() - postprocessStart
 
-            // Report real barbell detections
-            if (detections.isNotEmpty()) {
-                realDetectionCount++
+            Log.d(TAG, "✅ Post-processing completed in ${postprocessTime}ms")
+            Log.d(TAG, "🎯 Raw detections found: ${detections.size}")
 
-                Log.e(TAG, "🏋️ BARBELL DETECTED! (Frame $frameCount, Total: $realDetectionCount)")
-                detections.forEachIndexed { index, detection ->
-                    val centerX = (detection.bbox.left + detection.bbox.right) / 2f
-                    val centerY = (detection.bbox.top + detection.bbox.bottom) / 2f
-                    val width = detection.bbox.right - detection.bbox.left
-                    val height = detection.bbox.bottom - detection.bbox.top
-                    val area = width * height
-                    val aspectRatio = if (height > 0) width / height else 1f
+            // Apply NMS and return results
+            val nmsStart = System.currentTimeMillis()
+            val filteredDetections = applyNMS(detections)
+            val nmsTime = System.currentTimeMillis() - nmsStart
 
-                    Log.e(TAG, "   Barbell ${index + 1}:")
-                    Log.e(TAG, "     🎯 Confidence: ${String.format("%.4f", detection.score)}")
-                    Log.e(TAG, "     📍 Center: (${String.format("%.2f", centerX)}, ${String.format("%.2f", centerY)})")
-                    Log.e(TAG, "     📏 Size: ${String.format("%.1f", width * 100)}% x ${String.format("%.1f", height * 100)}%")
-                    Log.e(TAG, "     📐 Aspect: ${String.format("%.2f", aspectRatio)} (${if (aspectRatio > 1.5f) "horizontal" else if (aspectRatio < 0.7f) "vertical" else "square"})")
-                    Log.e(TAG, "     📊 Area: ${String.format("%.1f", area * 100)}%")
+            Log.d(TAG, "✅ NMS completed in ${nmsTime}ms")
+            Log.d(TAG, "🎯 Final detections: ${filteredDetections.size}")
+
+            if (filteredDetections.isNotEmpty()) {
+                Log.d(TAG, "🎯 Detected ${filteredDetections.size} objects with generic detector")
+                filteredDetections.forEachIndexed { index, detection ->
+                    Log.d(TAG, "Detection $index: conf=${String.format("%.3f", detection.score)}, " +
+                            "bbox=[${String.format("%.3f", detection.bbox.left)}, " +
+                            "${String.format("%.3f", detection.bbox.top)}, " +
+                            "${String.format("%.3f", detection.bbox.right)}, " +
+                            "${String.format("%.3f", detection.bbox.bottom)}]")
                 }
+            } else {
+                Log.d(TAG, "⚠️ No valid detections found")
+                // Debug: Log some raw output to understand what the model is producing
+                Log.d(TAG, "🔍 Debugging raw output...")
 
-                showToast("🏋️ ${detections.size} barbell(s) detected!")
+                // Create local reference to avoid smart cast issues
+                val localOutputBuffer = outputBuffer
+
+                when (localOutputBuffer) {
+                    is Array<*> -> {
+                        if (localOutputBuffer.isNotEmpty() && localOutputBuffer[0] is Array<*>) {
+                            val output3D = localOutputBuffer as Array<Array<FloatArray>>
+                            Log.d(TAG, "Raw output shape: [${output3D.size}][${output3D[0].size}][${output3D[0][0].size}]")
+                            if (output3D[0].isNotEmpty()) {
+                                val firstDetection = output3D[0][0]
+                                Log.d(TAG, "First detection raw: ${firstDetection.take(10).joinToString(", ")}")
+                                Log.d(TAG, "Max confidence in first detection: ${firstDetection.maxOrNull()}")
+                            }
+                        } else if (localOutputBuffer.isNotEmpty() && localOutputBuffer[0] is FloatArray) {
+                            val output2D = localOutputBuffer as Array<FloatArray>
+                            Log.d(TAG, "Raw output shape: [${output2D.size}][${output2D[0].size}]")
+                            if (output2D.isNotEmpty()) {
+                                Log.d(TAG, "First row: ${output2D[0].take(10).joinToString(", ")}")
+                                Log.d(TAG, "Max value in first row: ${output2D[0].maxOrNull()}")
+                            }
+                        }
+                    }
+                    is FloatArray -> {
+                        val output1D = localOutputBuffer as FloatArray
+                        Log.d(TAG, "Raw output size: ${output1D.size}")
+                        Log.d(TAG, "First 10 values: ${output1D.take(10).joinToString(", ")}")
+                        Log.d(TAG, "Max value: ${output1D.maxOrNull()}")
+                    }
+                    else -> {
+                        Log.d(TAG, "Unknown output buffer type: ${localOutputBuffer.javaClass.simpleName}")
+                    }
+                }
             }
 
-            // Periodic stats with threshold info
-            if (frameCount % 30 == 0) {
-                val currentMaxConf = outputBuffer[0][4].maxOrNull() ?: 0f
-                val rawDetectionCount = countRawDetections()
-                val centerDetectionCount = countCenterDetections()
-                val filteredCount = centerDetectionCount - detections.size
+            // Log performance summary
+            val totalTime = preprocessTime + inferenceTime + postprocessTime + nmsTime
+            Log.d(TAG, "📊 Performance: Total=${totalTime}ms (prep=${preprocessTime}ms, inf=${inferenceTime}ms, post=${postprocessTime}ms, nms=${nmsTime}ms)")
 
-                Log.e(TAG, "📊 DETECTION STATS (Frame $frameCount):")
-                Log.e(TAG, "   🎛️ Current threshold: ${String.format("%.4f", confThreshold)}")
-                Log.e(TAG, "   📈 Max confidence: ${String.format("%.4f", currentMaxConf)}")
-                Log.e(TAG, "   🔍 Raw detections: $rawDetectionCount")
-                Log.e(TAG, "   🎯 Center detections: $centerDetectionCount")
-                Log.e(TAG, "   ❌ Edge filtered: ${rawDetectionCount - centerDetectionCount}")
-                Log.e(TAG, "   ✅ Valid barbells: ${detections.size}")
-                Log.e(TAG, "   🏋️ Total barbells found: $realDetectionCount")
-
-                if (rawDetectionCount == 0 && currentMaxConf > 0.001f) {
-                    Log.e(TAG, "   💡 Threshold may be too high - consider lowering")
-                }
-            }
-
-            detections
+            filteredDetections
 
         } catch (e: Exception) {
             Log.e(TAG, "❌ Detection error: ${e.message}", e)
+            Log.e(TAG, "Input shape: ${inputShape.contentToString()}")
+            Log.e(TAG, "Input buffer capacity: ${if (::inputBuffer.isInitialized) inputBuffer.capacity() else "not initialized"}")
+            Log.e(TAG, "Model type: $modelType")
             emptyList()
         }
     }
 
-    private fun dynamicallyAdjustThreshold() {
-        val currentTime = System.currentTimeMillis()
-
-        // Adjust threshold every 3 seconds
-        if (currentTime - lastThresholdAdjustment > ADJUSTMENT_INTERVAL) {
-            val currentMaxConf = outputBuffer[0][4].maxOrNull() ?: 0f
-            recentMaxConfidences.add(currentMaxConf)
-
-            // Keep only recent confidences
-            if (recentMaxConfidences.size > 10) {
-                recentMaxConfidences.removeAt(0)
-            }
-
-            val avgMaxConf = if (recentMaxConfidences.isNotEmpty()) {
-                recentMaxConfidences.average().toFloat()
-            } else currentMaxConf
-
-            val rawDetectionCount = countRawDetections()
-            val centerDetectionCount = countCenterDetections()
-
-            val oldThreshold = confThreshold
-
-            // Threshold adjustment logic
-            when {
-                // No raw detections but high confidence available - lower threshold
-                rawDetectionCount == 0 && avgMaxConf > confThreshold * 2f -> {
-                    confThreshold = maxOf(avgMaxConf * 0.7f, confThreshold - THRESHOLD_STEP)
-                    Log.e(TAG, "🔽 Lowering threshold to find barbells: $oldThreshold -> $confThreshold")
-                }
-
-                // Too many raw detections but no center ones - edges detected, raise threshold slightly
-                rawDetectionCount > 10 && centerDetectionCount == 0 -> {
-                    confThreshold = minOf(confThreshold + THRESHOLD_STEP, avgMaxConf * 0.8f)
-                    Log.e(TAG, "🔼 Raising threshold to reduce edge noise: $oldThreshold -> $confThreshold")
-                }
-
-                // Good balance - center detections found
-                centerDetectionCount in 1..5 -> {
-                    // Threshold is working well, no change
-                    Log.e(TAG, "✅ Threshold working well: $confThreshold")
-                }
-
-                // Too many center detections - might be noise
-                centerDetectionCount > 5 -> {
-                    confThreshold = minOf(confThreshold + THRESHOLD_STEP * 0.5f, MAX_THRESHOLD)
-                    Log.e(TAG, "🔼 Too many detections, raising threshold: $oldThreshold -> $confThreshold")
-                }
-            }
-
-            // Apply bounds
-            confThreshold = confThreshold.coerceIn(MIN_THRESHOLD, MAX_THRESHOLD)
-
-            if (abs(confThreshold - oldThreshold) > 0.0005f) {
-                showToast("Threshold: ${String.format("%.4f", confThreshold)}")
-            }
-
-            lastThresholdAdjustment = currentTime
-        }
-    }
-
-    private fun countRawDetections(): Int {
-        return try {
-            val confArray = outputBuffer[0][4]
-            confArray.count { it >= confThreshold }
-        } catch (e: Exception) {
-            0
-        }
-    }
-
-    private fun countCenterDetections(): Int {
-        val centerDetections = mutableListOf<Detection>()
+    private fun processYOLOOutput(): List<Detection> {
+        val detections = mutableListOf<Detection>()
 
         try {
-            val numDetections = actualOutputShape[2]
-            val xArray = outputBuffer[0][0]
-            val yArray = outputBuffer[0][1]
-            val wArray = outputBuffer[0][2]
-            val hArray = outputBuffer[0][3]
-            val confArray = outputBuffer[0][4]
+            val output = outputBuffer as Array<Array<FloatArray>>
+            val numDetections = output[0].size
+            val numFeatures = output[0][0].size
+
+            Log.d(TAG, "Processing YOLO output: $numDetections detections, $numFeatures features")
 
             for (i in 0 until numDetections) {
-                val conf = confArray[i]
+                val detection = output[0][i]
 
-                if (conf >= confThreshold) {
-                    val x = xArray[i]
-                    val y = yArray[i]
-                    val w = wArray[i]
-                    val h = hArray[i]
+                // YOLO format: [x, y, w, h, confidence, class_scores...]
+                if (detection.size >= 5) {
+                    val x = detection[0]
+                    val y = detection[1]
+                    val w = detection[2]
+                    val h = detection[3]
+                    val confidence = detection[4]
 
-                    val detection = createDetection(x, y, w, h, conf)
-                    if (detection != null && isValidCenterDetection(detection)) {
-                        centerDetections.add(detection)
+                    if (confidence >= confThreshold) {
+                        val left = (x - w / 2f).coerceIn(0f, 1f)
+                        val top = (y - h / 2f).coerceIn(0f, 1f)
+                        val right = (x + w / 2f).coerceIn(0f, 1f)
+                        val bottom = (y + h / 2f).coerceIn(0f, 1f)
+
+                        if (right > left && bottom > top) {
+                            detections.add(Detection(
+                                bbox = RectF(left, top, right, bottom),
+                                score = confidence,
+                                classId = 0 // Assume barbell class
+                            ))
+                        }
                     }
                 }
             }
         } catch (e: Exception) {
-            // Ignore
+            Log.e(TAG, "Error processing YOLO output: ${e.message}")
         }
 
-        return centerDetections.size
+        return detections
     }
 
-    private fun processDetectionsWithFiltering(): List<Detection> {
-        val centerDetections = mutableListOf<Detection>()
+    private fun processEfficientDetOutput(): List<Detection> {
+        val detections = mutableListOf<Detection>()
 
         try {
-            val numDetections = actualOutputShape[2]
-            val xArray = outputBuffer[0][0]
-            val yArray = outputBuffer[0][1]
-            val wArray = outputBuffer[0][2]
-            val hArray = outputBuffer[0][3]
-            val confArray = outputBuffer[0][4]
+            val localOutputBuffer = outputBuffer
 
-            for (i in 0 until numDetections) {
-                val conf = confArray[i]
+            when (localOutputBuffer) {
+                is Array<*> -> {
+                    if (localOutputBuffer.isNotEmpty() && localOutputBuffer[0] is FloatArray) {
+                        val output2D = localOutputBuffer as Array<FloatArray>
 
-                if (conf >= confThreshold) {
-                    val x = xArray[i]
-                    val y = yArray[i]
-                    val w = wArray[i]
-                    val h = hArray[i]
+                        Log.d(TAG, "Processing EfficientDet output: ${output2D.size} x ${output2D[0].size}")
 
-                    val detection = createDetection(x, y, w, h, conf)
-                    if (detection != null && isValidCenterDetection(detection)) {
-                        centerDetections.add(detection)
+                        // Check if this is actually a classification output [1, 25]
+                        if (output2D.size == 1 && output2D[0].size == 25) {
+                            Log.d(TAG, "🎯 Detected classification-style output with 25 classes")
+
+                            // Treat as classification - find highest confidence class
+                            val classScores = output2D[0]
+                            val maxConfidence = classScores.maxOrNull() ?: 0f
+                            val maxClassIndex = classScores.indexOfFirst { it == maxConfidence }
+
+                            Log.d(TAG, "Max confidence: $maxConfidence at class $maxClassIndex")
+
+                            // If confidence is above threshold, create a detection
+                            // Since this is classification, we don't have real bbox coordinates
+                            // We'll create a generic detection that the tracker can use
+                            if (maxConfidence > confThreshold) {
+                                // Create a detection covering a reasonable area in the center
+                                // The tracker will handle the actual object tracking
+                                detections.add(Detection(
+                                    bbox = android.graphics.RectF(0.25f, 0.25f, 0.75f, 0.75f), // Center 50% area
+                                    score = maxConfidence,
+                                    classId = maxClassIndex
+                                ))
+                                Log.d(TAG, "✅ Created classification detection: conf=$maxConfidence, class=$maxClassIndex")
+                            } else {
+                                Log.d(TAG, "⚠️ Confidence $maxConfidence below threshold $confThreshold")
+                            }
+                        } else {
+                            // Standard EfficientDet processing
+                            Log.d(TAG, "Processing standard EfficientDet format")
+
+                            for (i in output2D.indices) {
+                                val row = output2D[i]
+                                if (row.size >= 5) {
+                                    val confidence = row[4]
+                                    if (confidence >= confThreshold) {
+                                        val left = row[0].coerceIn(0f, 1f)
+                                        val top = row[1].coerceIn(0f, 1f)
+                                        val right = row[2].coerceIn(0f, 1f)
+                                        val bottom = row[3].coerceIn(0f, 1f)
+
+                                        if (right > left && bottom > top) {
+                                            detections.add(Detection(
+                                                bbox = android.graphics.RectF(left, top, right, bottom),
+                                                score = confidence,
+                                                classId = 0
+                                            ))
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                else -> {
+                    Log.d(TAG, "Unknown EfficientDet output format: ${localOutputBuffer.javaClass.simpleName}")
+                }
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Error processing EfficientDet output: ${e.message}")
+        }
+
+        return detections
+    }
+
+    private fun processMobileNetOutput(): List<Detection> {
+        val detections = mutableListOf<Detection>()
+
+        try {
+            val output = outputBuffer as Array<Array<FloatArray>>
+
+            Log.d(TAG, "Processing MobileNet output")
+
+            // MobileNet SSD format processing
+            for (i in output[0].indices) {
+                val detection = output[0][i]
+                if (detection.size >= 4) {
+                    // Assume confidence is in a separate tensor or last element
+                    val confidence = if (detection.size > 4) detection[4] else 0.5f
+
+                    if (confidence >= confThreshold) {
+                        val left = detection[0].coerceIn(0f, 1f)
+                        val top = detection[1].coerceIn(0f, 1f)
+                        val right = detection[2].coerceIn(0f, 1f)
+                        val bottom = detection[3].coerceIn(0f, 1f)
+
+                        if (right > left && bottom > top) {
+                            detections.add(Detection(
+                                bbox = RectF(left, top, right, bottom),
+                                score = confidence,
+                                classId = 0
+                            ))
+                        }
                     }
                 }
             }
-
         } catch (e: Exception) {
-            Log.e(TAG, "Error processing detections: ${e.message}")
+            Log.e(TAG, "Error processing MobileNet output: ${e.message}")
         }
 
-        return applyNMS(centerDetections)
+        return detections
     }
 
-    private fun isValidCenterDetection(detection: Detection): Boolean {
-        val bbox = detection.bbox
+    private fun processGenericOutput(): List<Detection> {
+        val detections = mutableListOf<Detection>()
 
-        val left = bbox.left
-        val top = bbox.top
-        val right = bbox.right
-        val bottom = bbox.bottom
-        val width = right - left
-        val height = bottom - top
-        val area = width * height
-        val centerX = (left + right) / 2f
-        val centerY = (top + bottom) / 2f
-        val aspectRatio = if (height > 0) width / height else 1f
+        try {
+            Log.d(TAG, "Processing generic model output")
 
-        // Filter 1: Remove edge detections
-        val tooCloseToEdge = left < EDGE_MARGIN || top < EDGE_MARGIN ||
-                right > (1f - EDGE_MARGIN) || bottom > (1f - EDGE_MARGIN)
+            // Try to interpret as a generic detection format
+            when (outputBuffer) {
+                is Array<*> -> {
+                    val output = outputBuffer as Array<*>
+                    Log.d(TAG, "Generic array output with ${output.size} elements")
 
-        if (tooCloseToEdge) return false
+                    // Try different interpretations
+                    if (output.isNotEmpty() && output[0] is FloatArray) {
+                        val floatOutput = output as Array<FloatArray>
+                        // Interpret as [num_detections, features]
+                        for (i in floatOutput.indices) {
+                            val row = floatOutput[i]
+                            if (row.size >= 5) {
+                                val confidence = row[4]
+                                if (confidence >= confThreshold) {
+                                    detections.add(Detection(
+                                        bbox = RectF(row[0], row[1], row[2], row[3]),
+                                        score = confidence,
+                                        classId = 0
+                                    ))
+                                }
+                            }
+                        }
+                    }
+                }
+                is FloatArray -> {
+                    val output = outputBuffer as FloatArray
+                    Log.d(TAG, "Generic float array output with ${output.size} elements")
 
-        // Filter 2: Area constraints
-        if (area < MIN_CENTER_AREA || area > MAX_CENTER_AREA) return false
-
-        // Filter 3: Aspect ratio constraints
-        if (aspectRatio < MIN_ASPECT_RATIO || aspectRatio > MAX_ASPECT_RATIO) return false
-
-        // Filter 4: Center region preference
-        val distanceFromCenter = kotlin.math.sqrt(
-            (centerX - 0.5f) * (centerX - 0.5f) + (centerY - 0.5f) * (centerY - 0.5f)
-        )
-
-        if (distanceFromCenter > 0.45f) return false
-
-        return true
-    }
-
-    private fun createDetection(x: Float, y: Float, w: Float, h: Float, conf: Float): Detection? {
-        return try {
-            var centerX = x
-            var centerY = y
-            var width = w
-            var height = h
-
-            if (x > 1f || y > 1f || w > 1f || h > 1f) {
-                centerX = x / inputSize
-                centerY = y / inputSize
-                width = w / inputSize
-                height = h / inputSize
+                    // Try to parse as flattened detection results
+                    val stride = 6 // Assuming [x1, y1, x2, y2, conf, class]
+                    for (i in 0 until output.size step stride) {
+                        if (i + stride <= output.size) {
+                            val confidence = output[i + 4]
+                            if (confidence >= confThreshold) {
+                                detections.add(Detection(
+                                    bbox = RectF(output[i], output[i + 1], output[i + 2], output[i + 3]),
+                                    score = confidence,
+                                    classId = output[i + 5].toInt()
+                                ))
+                            }
+                        }
+                    }
+                }
             }
-
-            val left = (centerX - width / 2f).coerceIn(0f, 1f)
-            val top = (centerY - height / 2f).coerceIn(0f, 1f)
-            val right = (centerX + width / 2f).coerceIn(0f, 1f)
-            val bottom = (centerY + height / 2f).coerceIn(0f, 1f)
-
-            if (right > left && bottom > top) {
-                Detection(RectF(left, top, right, bottom), conf, 0)
-            } else null
-
         } catch (e: Exception) {
-            null
+            Log.e(TAG, "Error processing generic output: ${e.message}")
         }
+
+        return detections
     }
 
     private fun applyNMS(detections: List<Detection>): List<Detection> {
@@ -445,8 +638,8 @@ class YOLOv8ObjectDetector(
         return if (unionArea > 0) intersectionArea / unionArea else 0f
     }
 
-    // Interface methods
-    fun getClassLabel(classId: Int): String = classLabels.getOrElse(classId) { "Unknown" }
+    // Interface methods for compatibility
+    fun getClassLabel(classId: Int): String = classLabels.getOrElse(classId) { "Object" }
 
     fun getDetectionCenter(detection: Detection): Pair<Float, Float> = Pair(
         (detection.bbox.left + detection.bbox.right) / 2f,
@@ -470,18 +663,20 @@ class YOLOv8ObjectDetector(
 
     fun isUsingGPU(): Boolean = false
 
-    fun getPerformanceInfo(): String = "Dynamic (${String.format("%.4f", confThreshold)}) - ${realDetectionCount} barbells"
+    fun getPerformanceInfo(): String = "Generic TFLite ($modelType) - ${getClassLabel(0)}"
 
-    fun cleanup() {}
-
-    fun close() {
-        cleanup()
+    fun cleanup() {
         if (::interpreter.isInitialized) {
             interpreter.close()
         }
     }
+
+    fun close() = cleanup()
 }
 
+/**
+ * Detection quality data class for compatibility
+ */
 data class DetectionQuality(
     val confidence: Float,
     val size: Float,
