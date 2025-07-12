@@ -50,10 +50,15 @@ import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
 import com.example.atry.detector.*
 import com.example.atry.ui.theme.TryTheme
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import java.io.FileInputStream
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
+import java.nio.channels.FileChannel
 import java.util.concurrent.Executors
 
 val Color.Companion.Orange: Color
@@ -68,7 +73,7 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        Log.d(TAG, "MainActivity onCreate with Optimized Barbell Detector (EfficientDet-Lite2)")
+        Log.d(TAG, "MainActivity onCreate with Enhanced Barbell Detector")
 
         setContent {
             TryTheme {
@@ -83,7 +88,6 @@ class MainActivity : ComponentActivity() {
     private fun MainContent() {
         val context = LocalContext.current
 
-        // Track permission state
         var hasCameraPermission by remember {
             mutableStateOf(
                 ContextCompat.checkSelfPermission(
@@ -96,7 +100,6 @@ class MainActivity : ComponentActivity() {
         var permissionRequested by remember { mutableStateOf(false) }
         var permissionDenied by remember { mutableStateOf(false) }
 
-        // Permission launcher
         val permissionLauncher = rememberLauncherForActivityResult(
             contract = ActivityResultContracts.RequestPermission()
         ) { isGranted ->
@@ -106,16 +109,15 @@ class MainActivity : ComponentActivity() {
 
             if (!isGranted) {
                 permissionDenied = true
-                Toast.makeText(context, "Camera permission is required for optimized barbell tracking", Toast.LENGTH_LONG).show()
+                Toast.makeText(context, "Camera permission is required for barbell tracking", Toast.LENGTH_LONG).show()
             } else {
-                Toast.makeText(context, "Camera permission granted - Optimized detector ready!", Toast.LENGTH_SHORT).show()
+                Toast.makeText(context, "Camera permission granted - Detector ready!", Toast.LENGTH_SHORT).show()
             }
         }
 
-        // Request permission on first launch
         LaunchedEffect(Unit) {
             if (!hasCameraPermission && !permissionRequested) {
-                Log.d(TAG, "Requesting camera permission for optimized barbell detector")
+                Log.d(TAG, "Requesting camera permission")
                 delay(300)
                 permissionLauncher.launch(Manifest.permission.CAMERA)
             }
@@ -124,8 +126,8 @@ class MainActivity : ComponentActivity() {
         Box(modifier = Modifier.fillMaxSize()) {
             when {
                 hasCameraPermission -> {
-                    Log.d(TAG, "Camera permission granted, showing optimized barbell camera preview")
-                    OptimizedBarbellCameraPreview()
+                    Log.d(TAG, "Camera permission granted, showing camera preview")
+                    EnhancedBarbellCameraPreview()
                 }
                 permissionDenied -> {
                     PermissionDeniedScreen {
@@ -143,115 +145,65 @@ class MainActivity : ComponentActivity() {
     }
 
     @Composable
-    private fun OptimizedBarbellCameraPreview() {
+    private fun EnhancedBarbellCameraPreview() {
         val context = LocalContext.current
         val lifecycleOwner = LocalLifecycleOwner.current
         val scope = rememberCoroutineScope()
 
-        Log.d("OptimizedCamera", "Initializing Optimized Barbell Detector (EfficientDet-Lite2)")
+        Log.d("EnhancedCamera", "Initializing Enhanced Barbell Detector")
 
-        // Create optimized detector specifically for your model
-        val detector = remember {
-            try {
-                Log.d("OptimizedCamera", "Creating Optimized Barbell Detector")
-                OptimizedBarbellDetector(
-                    context = context,
-                    modelPath = "simonskina.tflite",
-                    confThreshold = 0.4f,  // Optimal for your model
-                    iouThreshold = 0.5f,
-                    maxDetections = 8      // Reasonable limit for barbells
-                )
-            } catch (e: Exception) {
-                Log.e("OptimizedCamera", "Failed to create Optimized Detector: ${e.message}", e)
-                null
-            }
-        }
+        // Enhanced detector state management
+        var detector by remember { mutableStateOf<OptimizedBarbellDetector?>(null) }
+        var detectorError by remember { mutableStateOf<String?>(null) }
+        var isDetectorInitializing by remember { mutableStateOf(true) }
 
-        if (detector == null) {
-            Box(
-                modifier = Modifier.fillMaxSize(),
-                contentAlignment = Alignment.Center
-            ) {
-                Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                    Text(
-                        text = "⚠️ Optimized Barbell Detector Failed",
-                        color = Color.Red,
-                        fontSize = 18.sp,
-                        fontWeight = FontWeight.Bold
-                    )
-                    Text(
-                        text = "Model: EfficientDet-Lite2 (448×448)\n• Float32 format\n• Single class (barbells)\n• Optimized preprocessing",
-                        color = Color.Gray,
-                        fontSize = 14.sp,
-                        textAlign = TextAlign.Center,
-                        modifier = Modifier.padding(16.dp)
-                    )
+        // Initialize detector with proper error handling
+        LaunchedEffect(Unit) {
+            scope.launch(Dispatchers.IO) {
+                try {
+                    Log.d("EnhancedCamera", "Creating Enhanced Barbell Detector...")
 
-                    Button(
-                        onClick = {
-                            scope.launch {
-                                try {
-                                    // Test optimized detector
-                                    val testDetector = OptimizedBarbellDetector(context)
+                    // First verify the model exists
+                    val modelVerifier = ModelVerifier(context)
+                    val specs = modelVerifier.verifySimonskinaModel()
 
-                                    // Create high-quality test image
-                                    val testBitmap = createOptimizedTestBarbell()
-                                    val detections = testDetector.detect(testBitmap)
+                    if (specs != null) {
+                        Log.d("EnhancedCamera", "✅ Model verified: ${specs.modelFormat}")
 
-                                    val message = buildString {
-                                        appendLine("✅ Optimized Test Results:")
-                                        appendLine("Detections: ${detections.size}")
-                                        detections.forEachIndexed { index, detection ->
-                                            val quality = testDetector.getDetectionQuality(detection)
-                                            appendLine("$index: ${String.format("%.1f%%", detection.score * 100)} (${quality.getQualityGrade()})")
-                                        }
-                                    }
+                        // Create detector with verified specs
+                        val newDetector = OptimizedBarbellDetector(
+                            context = context,
+                            modelPath = "simonskina.tflite",
+                            confThreshold = 0.3f,  // Lower threshold for testing
+                            iouThreshold = 0.5f,
+                            maxDetections = 5
+                        )
 
-                                    Toast.makeText(context, message, Toast.LENGTH_LONG).show()
-                                    testDetector.cleanup()
-
-                                } catch (e: Exception) {
-                                    Toast.makeText(context, "❌ Test failed: ${e.message}", Toast.LENGTH_LONG).show()
-                                    Log.e("OptimizedCamera", "Test error", e)
-                                }
+                        if (newDetector.isInitialized()) {
+                            withContext(Dispatchers.Main) {
+                                detector = newDetector
+                                detectorError = null
+                                isDetectorInitializing = false
+                                Log.d("EnhancedCamera", "✅ Enhanced detector initialized successfully")
                             }
+                        } else {
+                            throw RuntimeException("Detector failed to initialize properly")
                         }
-                    ) {
-                        Text("Test Optimized Detector")
+                    } else {
+                        throw RuntimeException("Model verification failed")
                     }
 
-                    Spacer(modifier = Modifier.height(16.dp))
-
-                    Button(
-                        onClick = {
-                            // Run model verification
-                            scope.launch {
-                                try {
-                                    val verifier = ModelVerifier(context)
-                                    val specs = verifier.verifySimonskinaModel()
-
-                                    val message = if (specs != null) {
-                                        "✅ Model verified!\nFormat: ${specs.modelFormat}\nInput: ${specs.inputShape.contentToString()}"
-                                    } else {
-                                        "❌ Model verification failed"
-                                    }
-
-                                    Toast.makeText(context, message, Toast.LENGTH_LONG).show()
-                                } catch (e: Exception) {
-                                    Toast.makeText(context, "Verification error: ${e.message}", Toast.LENGTH_SHORT).show()
-                                }
-                            }
-                        }
-                    ) {
-                        Text("Verify Model")
+                } catch (e: Exception) {
+                    Log.e("EnhancedCamera", "❌ Failed to create detector: ${e.message}", e)
+                    withContext(Dispatchers.Main) {
+                        detectorError = "Detector initialization failed: ${e.message}"
+                        isDetectorInitializing = false
                     }
                 }
             }
-            return
         }
 
-        // State variables
-        val previewView = remember { PreviewView(context) }
+        // UI State
         var barbellDetections by remember { mutableStateOf<List<Detection>>(emptyList()) }
         var isProcessing by remember { mutableStateOf(false) }
         var fps by remember { mutableStateOf(0f) }
@@ -264,7 +216,7 @@ class MainActivity : ComponentActivity() {
         var averageConfidence by remember { mutableStateOf(0f) }
         var detectionHistory by remember { mutableStateOf<List<Int>>(emptyList()) }
 
-        // Enhanced barbell tracking
+        // Enhanced tracking
         val tracker = remember {
             try {
                 EnhancedBarbellTracker(
@@ -275,7 +227,7 @@ class MainActivity : ComponentActivity() {
                     maxAge = 30
                 )
             } catch (e: Exception) {
-                Log.e("OptimizedCamera", "Failed to create Enhanced Tracker: ${e.message}", e)
+                Log.e("EnhancedCamera", "Failed to create Enhanced Tracker: ${e.message}", e)
                 null
             }
         }
@@ -290,203 +242,117 @@ class MainActivity : ComponentActivity() {
         // Report generator
         val reportGenerator = remember { ReportGenerator(context) }
 
-        // Cleanup
-        DisposableEffect(detector, tracker) {
-            onDispose {
-                try {
-                    detector.cleanup()
-                    tracker?.cleanup()
-                    Log.d("OptimizedCamera", "Optimized detector and tracker cleaned up")
-                } catch (e: Exception) {
-                    Log.e("OptimizedCamera", "Cleanup error: ${e.message}", e)
-                }
+        // Show appropriate UI based on detector state
+        when {
+            isDetectorInitializing -> {
+                LoadingScreen("Initializing Enhanced Barbell Detector...")
             }
-        }
-
-        // Optimized camera setup
-        LaunchedEffect(previewView) {
-            try {
-                Log.d("OptimizedCamera", "Setting up optimized camera for barbell detection")
-                val cameraProvider = ProcessCameraProvider.getInstance(context).get()
-
-                val preview = Preview.Builder()
-                    .setTargetResolution(Size(1280, 720)) // High quality preview
-                    .build()
-                    .also { it.setSurfaceProvider(previewView.surfaceProvider) }
-
-                val imageAnalysis = androidx.camera.core.ImageAnalysis.Builder()
-                    .setBackpressureStrategy(androidx.camera.core.ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
-                    .setTargetResolution(Size(640, 480)) // Good balance for 448×448 model
-                    .setOutputImageFormat(androidx.camera.core.ImageAnalysis.OUTPUT_IMAGE_FORMAT_YUV_420_888)
-                    .build()
-                    .also { analyzer ->
-                        analyzer.setAnalyzer(Executors.newSingleThreadExecutor()) { imageProxy ->
-                            if (isProcessing) {
-                                imageProxy.close()
-                                return@setAnalyzer
-                            }
-
-                            isProcessing = true
-                            val processingStart = System.currentTimeMillis()
-
-                            scope.launch(Dispatchers.Default) {
-                                try {
-                                    // Convert to bitmap with optimization
-                                    val bitmap = BitmapUtils.imageProxyToBitmapOptimized(imageProxy)
-                                    val timestamp = System.currentTimeMillis()
-
-                                    // Run optimized barbell detection
-                                    val newDetections = detector.detect(bitmap)
-
-                                    // Use enhanced tracker if available
-                                    val trackingResult = tracker?.track(bitmap, timestamp)
-
+            detectorError != null -> {
+                EnhancedErrorScreen(
+                    error = detectorError!!,
+                    onRetry = {
+                        isDetectorInitializing = true
+                        detectorError = null
+                        // Trigger re-initialization
+                        scope.launch(Dispatchers.IO) {
+                            try {
+                                delay(500)
+                                val newDetector = OptimizedBarbellDetector(context)
+                                if (newDetector.isInitialized()) {
                                     withContext(Dispatchers.Main) {
-                                        barbellDetections = newDetections
-                                        processingTime = System.currentTimeMillis() - processingStart
-
-                                        // Update detection history for trending
-                                        detectionHistory = (detectionHistory + newDetections.size).takeLast(10)
-
-                                        // Calculate average confidence
-                                        averageConfidence = if (newDetections.isNotEmpty()) {
-                                            newDetections.map { it.score }.average().toFloat()
-                                        } else {
-                                            0f
-                                        }
-
-                                        // Update analytics if recording
-                                        if (isRecording && tracker != null) {
-                                            analytics = tracker.getAnalytics()
-                                        }
-
-                                        // Enhanced logging
-                                        if (newDetections.isNotEmpty()) {
-                                            Log.d("OptimizedCamera", "🏋️ Found ${newDetections.size} barbells, avg conf: ${String.format("%.2f", averageConfidence)}")
-
-                                            newDetections.forEachIndexed { index, detection ->
-                                                val quality = detector.getDetectionQuality(detection)
-                                                Log.d("OptimizedCamera", "  Barbell $index: ${String.format("%.1f%%", detection.score * 100)} " +
-                                                        "(${quality.getQualityGrade()}, size: ${String.format("%.3f", quality.size)})")
-                                            }
-                                        } else if (frameCount % 30 == 0) {
-                                            Log.d("OptimizedCamera", "No barbells detected (frame $frameCount)")
-                                        }
+                                        detector = newDetector
+                                        detectorError = null
+                                        isDetectorInitializing = false
                                     }
-
-                                    // FPS calculation
-                                    frameCount++
-                                    val currentTime = System.currentTimeMillis()
-                                    if (currentTime - lastFpsUpdate >= 1500) {
-                                        val newFps = frameCount * 1000f / (currentTime - lastFpsUpdate)
-                                        withContext(Dispatchers.Main) {
-                                            fps = newFps
-                                        }
-                                        frameCount = 0
-                                        lastFpsUpdate = currentTime
-                                    }
-
-                                } catch (e: Exception) {
-                                    Log.e("OptimizedCamera", "Optimized detection error: ${e.message}")
-                                } finally {
-                                    isProcessing = false
-                                    imageProxy.close()
+                                } else {
+                                    throw RuntimeException("Retry initialization failed")
+                                }
+                            } catch (e: Exception) {
+                                withContext(Dispatchers.Main) {
+                                    detectorError = "Retry failed: ${e.message}"
+                                    isDetectorInitializing = false
                                 }
                             }
                         }
-                    }
+                    },
+                    onTest = {
+                        scope.launch {
+                            try {
+                                val testBitmap = createTestBarbell()
+                                val testDetector = OptimizedBarbellDetector(context)
+                                val detections = testDetector.detect(testBitmap)
 
-                // Bind camera
-                cameraProvider.unbindAll()
-                cameraProvider.bindToLifecycle(
-                    lifecycleOwner,
-                    CameraSelector.DEFAULT_BACK_CAMERA,
-                    preview,
-                    imageAnalysis
-                )
+                                val message = "Test Results:\n" +
+                                        "Detections: ${detections.size}\n" +
+                                        "Detector initialized: ${testDetector.isInitialized()}"
 
-                Log.d("OptimizedCamera", "Optimized camera setup complete")
-                cameraError = null
-
-            } catch (e: Exception) {
-                val errorMsg = "Optimized camera setup failed: ${e.message}"
-                Log.e("OptimizedCamera", errorMsg, e)
-                cameraError = errorMsg
-            }
-        }
-
-        // UI Layout
-        Box(modifier = Modifier.fillMaxSize()) {
-            if (cameraError != null) {
-                // Show error state
-                Box(
-                    modifier = Modifier.fillMaxSize(),
-                    contentAlignment = Alignment.Center
-                ) {
-                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                        Text(
-                            text = "📷 Optimized Camera Error",
-                            color = Color.Red,
-                            fontSize = 18.sp,
-                            fontWeight = FontWeight.Bold
-                        )
-                        Spacer(modifier = Modifier.height(8.dp))
-                        Text(
-                            text = cameraError!!,
-                            color = Color.Gray,
-                            fontSize = 12.sp,
-                            textAlign = TextAlign.Center,
-                            modifier = Modifier.padding(16.dp)
-                        )
-                        Button(
-                            onClick = { cameraError = null }
-                        ) {
-                            Text("Retry")
+                                Toast.makeText(context, message, Toast.LENGTH_LONG).show()
+                                testDetector.cleanup()
+                            } catch (e: Exception) {
+                                Toast.makeText(context, "Test failed: ${e.message}", Toast.LENGTH_LONG).show()
+                            }
                         }
                     }
-                }
-            } else {
-                // Camera Preview
-                AndroidView(
-                    factory = { previewView },
-                    modifier = Modifier.fillMaxSize()
                 )
-
-                // Optimized Detection Overlay
-                Canvas(modifier = Modifier.fillMaxSize()) {
-                    drawOptimizedBarbellDetections(barbellDetections, detector)
-                }
-
-                // Enhanced Info Panel
-                OptimizedBarbellInfoPanel(
-                    detections = barbellDetections,
-                    analytics = analytics,
+            }
+            detector != null -> {
+                CameraPreviewWithDetection(
+                    detector = detector!!,
+                    tracker = tracker,
+                    barbellDetections = barbellDetections,
+                    isProcessing = isProcessing,
                     fps = fps,
                     processingTime = processingTime,
                     averageConfidence = averageConfidence,
                     detectionHistory = detectionHistory,
-                    isProcessing = isProcessing,
                     isRecording = isRecording,
                     isGeneratingReport = isGeneratingReport,
-                    detector = detector,
+                    analytics = analytics,
+                    onDetectionsUpdated = { newDetections ->
+                        barbellDetections = newDetections
+                        detectionHistory = (detectionHistory + newDetections.size).takeLast(10)
+                        averageConfidence = if (newDetections.isNotEmpty()) {
+                            newDetections.map { it.score }.average().toFloat()
+                        } else {
+                            0f
+                        }
+                    },
+                    onProcessingStateChanged = { processing ->
+                        isProcessing = processing
+                    },
+                    onProcessingTimeUpdated = { time ->
+                        processingTime = time
+                    },
+                    onFpsUpdated = { newFps ->
+                        fps = newFps
+                        frameCount++
+                        val currentTime = System.currentTimeMillis()
+                        if (currentTime - lastFpsUpdate >= 1500) {
+                            frameCount = 0
+                            lastFpsUpdate = currentTime
+                        }
+                    },
+                    onCameraError = { error ->
+                        cameraError = error
+                    },
                     onStartStopRecording = {
                         isRecording = !isRecording
-                        Log.d("OptimizedCamera", "Recording toggled - isRecording: $isRecording")
+                        Log.d("EnhancedCamera", "Recording toggled - isRecording: $isRecording")
                         if (isRecording) {
                             tracker?.reset()
                             sessionStartTime = System.currentTimeMillis()
-                            Log.d("OptimizedCamera", "Started optimized recording")
+                            Log.d("EnhancedCamera", "Started enhanced recording")
                         } else {
                             sessionEndTime = System.currentTimeMillis()
                             analytics = tracker?.getAnalytics()
-                            Log.d("OptimizedCamera", "Stopped optimized recording")
+                            Log.d("EnhancedCamera", "Stopped enhanced recording")
                         }
                     },
                     onClearData = {
                         tracker?.reset()
                         analytics = null
                         detectionHistory = emptyList()
-                        Log.d("OptimizedCamera", "Cleared all tracking data")
+                        Log.d("EnhancedCamera", "Cleared all tracking data")
                     },
                     onGenerateExcelReport = {
                         scope.launch {
@@ -510,7 +376,7 @@ class MainActivity : ComponentActivity() {
                                     },
                                     onFailure = { error ->
                                         Toast.makeText(context, "❌ Excel report error: ${error.message}", Toast.LENGTH_LONG).show()
-                                        Log.e("OptimizedCamera", "Excel report error", error)
+                                        Log.e("EnhancedCamera", "Excel report error", error)
                                     }
                                 )
                             } finally {
@@ -540,21 +406,403 @@ class MainActivity : ComponentActivity() {
                                     },
                                     onFailure = { error ->
                                         Toast.makeText(context, "❌ CSV report error: ${error.message}", Toast.LENGTH_LONG).show()
-                                        Log.e("OptimizedCamera", "CSV report error", error)
+                                        Log.e("EnhancedCamera", "CSV report error", error)
                                     }
                                 )
                             } finally {
                                 isGeneratingReport = false
                             }
                         }
-                    },
-                    modifier = Modifier.align(Alignment.TopStart)
+                    }
+                )
+            }
+        }
+
+        // Cleanup
+        DisposableEffect(detector, tracker) {
+            onDispose {
+                try {
+                    detector?.cleanup()
+                    tracker?.cleanup()
+                    Log.d("EnhancedCamera", "Enhanced detector and tracker cleaned up")
+                } catch (e: Exception) {
+                    Log.e("EnhancedCamera", "Cleanup error: ${e.message}", e)
+                }
+            }
+        }
+    }
+
+    @Composable
+    private fun LoadingScreen(message: String) {
+        Box(
+            modifier = Modifier.fillMaxSize(),
+            contentAlignment = Alignment.Center
+        ) {
+            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                CircularProgressIndicator(
+                    modifier = Modifier.size(48.dp),
+                    color = Color.Cyan
+                )
+                Spacer(modifier = Modifier.height(16.dp))
+                Text(
+                    text = message,
+                    color = Color.White,
+                    fontSize = 16.sp,
+                    textAlign = TextAlign.Center
+                )
+                Spacer(modifier = Modifier.height(8.dp))
+                Text(
+                    text = "Please wait...",
+                    color = Color.Gray,
+                    fontSize = 14.sp,
+                    textAlign = TextAlign.Center
                 )
             }
         }
     }
 
-    // Add this composable to your MainActivity.kt (inside the MainActivity class)
+    @Composable
+    private fun EnhancedErrorScreen(
+        error: String,
+        onRetry: () -> Unit,
+        onTest: () -> Unit
+    ) {
+        val context = LocalContext.current
+        val scope = rememberCoroutineScope()
+
+        Box(
+            modifier = Modifier.fillMaxSize(),
+            contentAlignment = Alignment.Center
+        ) {
+            Column(
+                horizontalAlignment = Alignment.CenterHorizontally,
+                modifier = Modifier.padding(32.dp)
+            ) {
+                Text(
+                    text = "⚠️",
+                    fontSize = 48.sp,
+                    color = Color.Red
+                )
+                Spacer(modifier = Modifier.height(16.dp))
+                Text(
+                    text = "Detector Initialization Failed",
+                    color = Color.Red,
+                    fontSize = 18.sp,
+                    fontWeight = FontWeight.Bold,
+                    textAlign = TextAlign.Center
+                )
+                Spacer(modifier = Modifier.height(8.dp))
+                Text(
+                    text = error,
+                    color = Color.Gray,
+                    fontSize = 12.sp,
+                    textAlign = TextAlign.Center
+                )
+
+                Spacer(modifier = Modifier.height(24.dp))
+
+                // Enhanced button row with debugging
+                Column(
+                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally
+                ) {
+                    Row(
+                        horizontalArrangement = Arrangement.spacedBy(12.dp)
+                    ) {
+                        Button(
+                            onClick = onRetry,
+                            colors = ButtonDefaults.buttonColors(containerColor = Color.Blue)
+                        ) {
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(4.dp)
+                            ) {
+                                Text("🔄", fontSize = 14.sp)
+                                Text("Retry", fontSize = 12.sp)
+                            }
+                        }
+
+                        Button(
+                            onClick = onTest,
+                            colors = ButtonDefaults.buttonColors(containerColor = Color.Green)
+                        ) {
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(4.dp)
+                            ) {
+                                Text("🧪", fontSize = 14.sp)
+                                Text("Test", fontSize = 12.sp)
+                            }
+                        }
+                    }
+
+                    // Add comprehensive debug button
+                    DebugButton(context, scope)
+
+                    // Model verification button
+                    Button(
+                        onClick = {
+                            scope.launch {
+                                try {
+                                    val verifier = ModelVerifier(context)
+                                    val specs = verifier.verifySimonskinaModel()
+
+                                    val message = if (specs != null) {
+                                        "✅ Model verified!\n" +
+                                                "Format: ${specs.modelFormat}\n" +
+                                                "Input: ${specs.inputShape.contentToString()}\n" +
+                                                "Outputs: ${specs.outputSpecs.size}"
+                                    } else {
+                                        "❌ Model verification failed"
+                                    }
+
+                                    Toast.makeText(context, message, Toast.LENGTH_LONG).show()
+
+                                    // Log detailed specs
+                                    specs?.let { s ->
+                                        Log.d("VERIFY", "📊 DETAILED MODEL SPECS:")
+                                        Log.d("VERIFY", "Input: ${s.inputShape.contentToString()} ${s.inputDataType}")
+                                        Log.d("VERIFY", "Input bytes: ${s.inputBytes}")
+                                        Log.d("VERIFY", "Format: ${s.modelFormat}")
+                                        s.outputSpecs.forEachIndexed { index, spec ->
+                                            Log.d("VERIFY", "Output $index: ${spec.name} ${spec.shape.contentToString()} ${spec.dataType}")
+                                        }
+                                        Log.d("VERIFY", "📋 RECOMMENDATIONS:")
+                                        s.recommendations.forEach { rec ->
+                                            Log.d("VERIFY", "  • $rec")
+                                        }
+                                    }
+                                } catch (e: Exception) {
+                                    Toast.makeText(context, "Verification error: ${e.message}", Toast.LENGTH_LONG).show()
+                                    Log.e("VERIFY", "Verification failed", e)
+                                }
+                            }
+                        },
+                        colors = ButtonDefaults.buttonColors(containerColor = Color.Cyan)
+                    ) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(4.dp)
+                        ) {
+                            Text("🔍", fontSize = 14.sp)
+                            Text("Verify", fontSize = 12.sp)
+                        }
+                    }
+
+                    // Dependencies check button
+                    Button(
+                        onClick = {
+                            scope.launch {
+                                checkDependencies(context)
+                            }
+                        },
+                        colors = ButtonDefaults.buttonColors(containerColor = Color.Orange)
+                    ) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(4.dp)
+                        ) {
+                            Text("📦", fontSize = 14.sp)
+                            Text("Deps", fontSize = 12.sp)
+                        }
+                    }
+                }
+
+                Spacer(modifier = Modifier.height(16.dp))
+
+                // Quick troubleshooting tips
+                Card(
+                    colors = CardDefaults.cardColors(
+                        containerColor = Color.Black.copy(alpha = 0.8f)
+                    ),
+                    shape = RoundedCornerShape(8.dp)
+                ) {
+                    Column(
+                        modifier = Modifier.padding(12.dp),
+                        verticalArrangement = Arrangement.spacedBy(4.dp)
+                    ) {
+                        Text(
+                            text = "🛠️ Quick Troubleshooting",
+                            color = Color.White,
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.Bold
+                        )
+                        Text(
+                            text = "1. Check LogCat for detailed errors\n" +
+                                    "2. Ensure simonskina.tflite is in assets/\n" +
+                                    "3. Try on physical device (not emulator)\n" +
+                                    "4. Update TensorFlow Lite dependencies",
+                            color = Color.Gray,
+                            fontSize = 10.sp
+                        )
+                    }
+                }
+            }
+        }
+    }
+
+    @Composable
+    private fun DebugButton(context: android.content.Context, scope: CoroutineScope) {
+        Button(
+            onClick = {
+                scope.launch {
+                    runComprehensiveDebug(context)
+                }
+            },
+            colors = ButtonDefaults.buttonColors(containerColor = Color.Magenta)
+        ) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(4.dp)
+            ) {
+                Text("🔬", fontSize = 14.sp)
+                Text("Full Debug", fontSize = 12.sp)
+            }
+        }
+    }
+
+    @Composable
+    private fun CameraPreviewWithDetection(
+        detector: OptimizedBarbellDetector,
+        tracker: EnhancedBarbellTracker?,
+        barbellDetections: List<Detection>,
+        isProcessing: Boolean,
+        fps: Float,
+        processingTime: Long,
+        averageConfidence: Float,
+        detectionHistory: List<Int>,
+        isRecording: Boolean,
+        isGeneratingReport: Boolean,
+        analytics: BarbellAnalytics?,
+        onDetectionsUpdated: (List<Detection>) -> Unit,
+        onProcessingStateChanged: (Boolean) -> Unit,
+        onProcessingTimeUpdated: (Long) -> Unit,
+        onFpsUpdated: (Float) -> Unit,
+        onCameraError: (String) -> Unit,
+        onStartStopRecording: () -> Unit,
+        onClearData: () -> Unit,
+        onGenerateExcelReport: () -> Unit,
+        onGenerateCSVReport: () -> Unit
+    ) {
+        val context = LocalContext.current
+        val lifecycleOwner = LocalLifecycleOwner.current
+        val scope = rememberCoroutineScope()
+        val previewView = remember { PreviewView(context) }
+
+        // Camera setup
+        LaunchedEffect(previewView) {
+            try {
+                Log.d("CameraPreview", "Setting up camera with enhanced detection")
+                val cameraProvider = ProcessCameraProvider.getInstance(context).get()
+
+                val preview = Preview.Builder()
+                    .setTargetResolution(Size(1280, 720))
+                    .build()
+                    .also { it.setSurfaceProvider(previewView.surfaceProvider) }
+
+                val imageAnalysis = androidx.camera.core.ImageAnalysis.Builder()
+                    .setBackpressureStrategy(androidx.camera.core.ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+                    .setTargetResolution(Size(640, 480))
+                    .setOutputImageFormat(androidx.camera.core.ImageAnalysis.OUTPUT_IMAGE_FORMAT_YUV_420_888)
+                    .build()
+                    .also { analyzer ->
+                        analyzer.setAnalyzer(Executors.newSingleThreadExecutor()) { imageProxy ->
+                            if (isProcessing) {
+                                imageProxy.close()
+                                return@setAnalyzer
+                            }
+
+                            onProcessingStateChanged(true)
+                            val processingStart = System.currentTimeMillis()
+
+                            scope.launch(Dispatchers.Default) {
+                                try {
+                                    // Convert to bitmap
+                                    val bitmap = BitmapUtils.imageProxyToBitmapOptimized(imageProxy)
+                                    val timestamp = System.currentTimeMillis()
+
+                                    // Run detection
+                                    val newDetections = detector.detect(bitmap)
+
+                                    // Use enhanced tracker if available
+                                    val trackingResult = tracker?.track(bitmap, timestamp)
+
+                                    withContext(Dispatchers.Main) {
+                                        onDetectionsUpdated(newDetections)
+                                        onProcessingTimeUpdated(System.currentTimeMillis() - processingStart)
+                                        onFpsUpdated(0f) // Will be calculated by parent
+
+                                        // Enhanced logging
+                                        if (newDetections.isNotEmpty()) {
+                                            Log.d("CameraPreview", "🏋️ Found ${newDetections.size} barbells")
+                                            newDetections.forEachIndexed { index, detection ->
+                                                val quality = detector.getDetectionQuality(detection)
+                                                Log.d("CameraPreview", "  Barbell $index: ${String.format("%.1f%%", detection.score * 100)} (${quality.getQualityGrade()})")
+                                            }
+                                        }
+                                    }
+
+                                } catch (e: Exception) {
+                                    Log.e("CameraPreview", "Detection error: ${e.message}", e)
+                                } finally {
+                                    onProcessingStateChanged(false)
+                                    imageProxy.close()
+                                }
+                            }
+                        }
+                    }
+
+                // Bind camera
+                cameraProvider.unbindAll()
+                cameraProvider.bindToLifecycle(
+                    lifecycleOwner,
+                    CameraSelector.DEFAULT_BACK_CAMERA,
+                    preview,
+                    imageAnalysis
+                )
+
+                Log.d("CameraPreview", "Camera setup complete")
+
+            } catch (e: Exception) {
+                val errorMsg = "Camera setup failed: ${e.message}"
+                Log.e("CameraPreview", errorMsg, e)
+                onCameraError(errorMsg)
+            }
+        }
+
+        // UI Layout
+        Box(modifier = Modifier.fillMaxSize()) {
+            // Camera Preview
+            AndroidView(
+                factory = { previewView },
+                modifier = Modifier.fillMaxSize()
+            )
+
+            // Detection Overlay
+            Canvas(modifier = Modifier.fillMaxSize()) {
+                drawBarbellDetections(barbellDetections, detector)
+            }
+
+            // Enhanced Info Panel
+            OptimizedBarbellInfoPanel(
+                detections = barbellDetections,
+                analytics = analytics,
+                fps = fps,
+                processingTime = processingTime,
+                averageConfidence = averageConfidence,
+                detectionHistory = detectionHistory,
+                isProcessing = isProcessing,
+                isRecording = isRecording,
+                isGeneratingReport = isGeneratingReport,
+                detector = detector,
+                onStartStopRecording = onStartStopRecording,
+                onClearData = onClearData,
+                onGenerateExcelReport = onGenerateExcelReport,
+                onGenerateCSVReport = onGenerateCSVReport,
+                modifier = Modifier.align(Alignment.TopStart)
+            )
+        }
+    }
 
     @Composable
     private fun OptimizedBarbellInfoPanel(
@@ -597,18 +845,6 @@ class MainActivity : ComponentActivity() {
                             shape = RoundedCornerShape(8.dp)
                         )
                         .padding(8.dp)
-                )
-                Text(
-                    text = "EfficientDet-Lite2 • 448×448 • Float32",
-                    color = Color.Cyan,
-                    fontSize = 11.sp,
-                    textAlign = TextAlign.Center,
-                    modifier = Modifier
-                        .background(
-                            Color.Black.copy(alpha = 0.6f),
-                            shape = RoundedCornerShape(6.dp)
-                        )
-                        .padding(4.dp)
                 )
 
                 Spacer(modifier = Modifier.height(6.dp))
@@ -658,47 +894,6 @@ class MainActivity : ComponentActivity() {
                     )
                 }
 
-                Spacer(modifier = Modifier.height(4.dp))
-
-                // Detection quality summary
-                if (detections.isNotEmpty()) {
-                    val qualityStats = detections.map { detector.getDetectionQuality(it) }
-                    val avgQuality = qualityStats.map { it.getOverallQuality() }.average().toFloat()
-                    val bestQuality = qualityStats.maxByOrNull { it.getOverallQuality() }
-
-                    Row(
-                        horizontalArrangement = Arrangement.spacedBy(8.dp),
-                        modifier = Modifier
-                            .background(
-                                Color.Black.copy(alpha = 0.6f),
-                                shape = RoundedCornerShape(6.dp)
-                            )
-                            .padding(6.dp)
-                    ) {
-                        Text(
-                            text = "Avg Conf: ${String.format("%.1f%%", averageConfidence * 100)}",
-                            color = Color.Cyan,
-                            fontSize = 10.sp
-                        )
-                        Text(
-                            text = "Quality: ${String.format("%.1f%%", avgQuality * 100)}",
-                            color = when {
-                                avgQuality >= 0.8f -> Color.Green
-                                avgQuality >= 0.6f -> Color.Yellow
-                                else -> Color.Orange
-                            },
-                            fontSize = 10.sp
-                        )
-                        bestQuality?.let {
-                            Text(
-                                text = "Best: ${it.getQualityGrade()}",
-                                color = Color.Green,
-                                fontSize = 10.sp
-                            )
-                        }
-                    }
-                }
-
                 Spacer(modifier = Modifier.height(6.dp))
 
                 // Control buttons
@@ -745,233 +940,6 @@ class MainActivity : ComponentActivity() {
                     }
                 }
 
-                Spacer(modifier = Modifier.height(4.dp))
-
-                // Recording status with enhanced info
-                if (isRecording) {
-                    Text(
-                        text = "🔴 RECORDING OPTIMIZED SESSION",
-                        color = Color.Red,
-                        fontSize = 12.sp,
-                        fontWeight = FontWeight.Bold,
-                        textAlign = TextAlign.Center,
-                        modifier = Modifier
-                            .background(
-                                Color.Black.copy(alpha = 0.7f),
-                                shape = RoundedCornerShape(6.dp)
-                            )
-                            .padding(6.dp)
-                    )
-                    analytics?.let { stats ->
-                        Text(
-                            text = "Reps: ${stats.repCount} • Distance: ${String.format("%.2f", stats.totalDistance)}",
-                            color = Color.Yellow,
-                            fontSize = 10.sp,
-                            textAlign = TextAlign.Center
-                        )
-                    }
-                } else {
-                    Text(
-                        text = "⚪ Ready for optimized tracking",
-                        color = Color.Gray,
-                        fontSize = 11.sp,
-                        textAlign = TextAlign.Center
-                    )
-                }
-
-                // Report generation buttons (only show when we have analytics data)
-                AnimatedVisibility(visible = analytics?.repCount ?: 0 > 0) {
-                    Column(
-                        verticalArrangement = Arrangement.spacedBy(4.dp),
-                        horizontalAlignment = Alignment.CenterHorizontally
-                    ) {
-                        Spacer(modifier = Modifier.height(6.dp))
-
-                        Row(
-                            horizontalArrangement = Arrangement.spacedBy(6.dp),
-                            modifier = Modifier.padding(horizontal = 8.dp)
-                        ) {
-                            Button(
-                                onClick = onGenerateExcelReport,
-                                enabled = !isGeneratingReport && (analytics?.repCount ?: 0) > 0,
-                                modifier = Modifier.height(30.dp),
-                                colors = ButtonDefaults.buttonColors(
-                                    containerColor = Color(0xFF007ACC),
-                                    disabledContainerColor = Color.Gray
-                                )
-                            ) {
-                                Row(
-                                    verticalAlignment = Alignment.CenterVertically,
-                                    horizontalArrangement = Arrangement.spacedBy(4.dp)
-                                ) {
-                                    Text(
-                                        text = if (isGeneratingReport) "⏳" else "📊",
-                                        fontSize = 10.sp,
-                                        color = Color.White
-                                    )
-                                    Text(
-                                        text = if (isGeneratingReport) "..." else "Excel",
-                                        fontSize = 9.sp,
-                                        color = Color.White
-                                    )
-                                }
-                            }
-
-                            Button(
-                                onClick = onGenerateCSVReport,
-                                enabled = !isGeneratingReport && (analytics?.repCount ?: 0) > 0,
-                                modifier = Modifier.height(30.dp),
-                                colors = ButtonDefaults.buttonColors(
-                                    containerColor = Color(0xFF228B22),
-                                    disabledContainerColor = Color.Gray
-                                )
-                            ) {
-                                Row(
-                                    verticalAlignment = Alignment.CenterVertically,
-                                    horizontalArrangement = Arrangement.spacedBy(4.dp)
-                                ) {
-                                    Text(
-                                        text = if (isGeneratingReport) "⏳" else "📋",
-                                        fontSize = 10.sp,
-                                        color = Color.White
-                                    )
-                                    Text(
-                                        text = if (isGeneratingReport) "..." else "CSV",
-                                        fontSize = 9.sp,
-                                        color = Color.White
-                                    )
-                                }
-                            }
-                        }
-                    }
-                }
-
-                // Detection history trend (mini chart)
-                if (detectionHistory.size >= 3) {
-                    Spacer(modifier = Modifier.height(6.dp))
-                    Column(
-                        horizontalAlignment = Alignment.CenterHorizontally,
-                        modifier = Modifier
-                            .background(
-                                Color.Black.copy(alpha = 0.6f),
-                                shape = RoundedCornerShape(6.dp)
-                            )
-                            .padding(6.dp)
-                    ) {
-                        Text(
-                            text = "Detection Trend:",
-                            color = Color.White,
-                            fontSize = 10.sp,
-                            fontWeight = FontWeight.Bold
-                        )
-
-                        Row(
-                            horizontalArrangement = Arrangement.spacedBy(2.dp),
-                            modifier = Modifier.padding(horizontal = 8.dp)
-                        ) {
-                            val maxDetections = detectionHistory.maxOrNull() ?: 1
-                            detectionHistory.takeLast(8).forEach { count ->
-                                val height = if (maxDetections > 0) {
-                                    (count.toFloat() / maxDetections * 16).coerceAtLeast(2f)
-                                } else 2f
-
-                                Box(
-                                    modifier = Modifier
-                                        .width(6.dp)
-                                        .height(height.dp)
-                                        .background(
-                                            color = when {
-                                                count == 0 -> Color.Gray
-                                                count <= 2 -> Color.Yellow
-                                                else -> Color.Green
-                                            },
-                                            shape = RoundedCornerShape(1.dp)
-                                        )
-                                )
-                            }
-                        }
-
-                        Text(
-                            text = "Recent: ${detectionHistory.takeLast(3).joinToString("-")}",
-                            color = Color.Cyan,
-                            fontSize = 9.sp,
-                            textAlign = TextAlign.Center
-                        )
-                    }
-                }
-
-                // Detailed analytics display
-                analytics?.let { stats ->
-                    Spacer(modifier = Modifier.height(6.dp))
-
-                    Card(
-                        modifier = Modifier
-                            .padding(horizontal = 8.dp),
-                        colors = CardDefaults.cardColors(
-                            containerColor = Color(0xFF1E3A8A).copy(alpha = 0.9f)
-                        ),
-                        shape = RoundedCornerShape(12.dp)
-                    ) {
-                        Column(
-                            modifier = Modifier.padding(12.dp),
-                            horizontalAlignment = Alignment.CenterHorizontally
-                        ) {
-                            Text(
-                                text = "📈 Optimized Analytics",
-                                color = Color.White,
-                                fontSize = 11.sp,
-                                fontWeight = FontWeight.Bold
-                            )
-
-                            Row(
-                                horizontalArrangement = Arrangement.spacedBy(8.dp)
-                            ) {
-                                Text(
-                                    text = "Reps: ${stats.repCount}",
-                                    color = Color.Cyan,
-                                    fontSize = 10.sp,
-                                    fontWeight = FontWeight.Bold
-                                )
-                                if (stats.totalDistance > 0) {
-                                    Text(
-                                        text = "Dist: ${String.format("%.1f", stats.totalDistance)}",
-                                        color = Color.Yellow,
-                                        fontSize = 10.sp
-                                    )
-                                }
-                                if (stats.averageVelocity > 0) {
-                                    Text(
-                                        text = "Vel: ${String.format("%.1f", stats.averageVelocity)}",
-                                        color = Color.Green,
-                                        fontSize = 10.sp
-                                    )
-                                }
-                            }
-
-                            if (stats.pathConsistency > 0) {
-                                Text(
-                                    text = "Consistency: ${String.format("%.0f%%", stats.pathConsistency * 100)}",
-                                    color = when {
-                                        stats.pathConsistency >= 0.8f -> Color.Green
-                                        stats.pathConsistency >= 0.6f -> Color.Yellow
-                                        else -> Color.Orange
-                                    },
-                                    fontSize = 10.sp,
-                                    fontWeight = FontWeight.Bold
-                                )
-                            }
-
-                            stats.primaryTrackingId?.let { id ->
-                                Text(
-                                    text = "Primary ID: $id",
-                                    color = Color.Magenta,
-                                    fontSize = 9.sp
-                                )
-                            }
-                        }
-                    }
-                }
-
                 // Processing status indicator
                 if (isProcessing) {
                     Spacer(modifier = Modifier.height(4.dp))
@@ -991,37 +959,10 @@ class MainActivity : ComponentActivity() {
                             fontSize = 12.sp
                         )
                         Text(
-                            text = "Processing optimized detection...",
+                            text = "Processing...",
                             color = Color.Yellow,
                             fontSize = 9.sp,
                             fontStyle = androidx.compose.ui.text.font.FontStyle.Italic
-                        )
-                    }
-                }
-
-                // Report generation status
-                if (isGeneratingReport) {
-                    Spacer(modifier = Modifier.height(4.dp))
-                    Row(
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(4.dp),
-                        modifier = Modifier
-                            .background(
-                                Color.Black.copy(alpha = 0.7f),
-                                shape = RoundedCornerShape(6.dp)
-                            )
-                            .padding(6.dp)
-                    ) {
-                        Text(
-                            text = "📄",
-                            color = Color.Cyan,
-                            fontSize = 12.sp
-                        )
-                        Text(
-                            text = "Generating optimized report...",
-                            color = Color.Cyan,
-                            fontSize = 10.sp,
-                            fontWeight = FontWeight.Bold
                         )
                     }
                 }
@@ -1053,60 +994,12 @@ class MainActivity : ComponentActivity() {
                         )
                     }
                 }
-
-                // Model performance info
-                Spacer(modifier = Modifier.height(4.dp))
-                Text(
-                    text = detector.getPerformanceInfo(),
-                    color = Color.Gray,
-                    fontSize = 8.sp,
-                    textAlign = TextAlign.Center,
-                    modifier = Modifier
-                        .padding(horizontal = 8.dp)
-                        .background(
-                            Color.Black.copy(alpha = 0.5f),
-                            shape = RoundedCornerShape(4.dp)
-                        )
-                        .padding(4.dp)
-                )
             }
         }
     }
 
-    // Helper function to create test image for optimized detector
-    private fun createOptimizedTestBarbell(): Bitmap {
-        val bitmap = Bitmap.createBitmap(448, 448, Bitmap.Config.ARGB_8888)
-        val canvas = Canvas(bitmap)
-        val paint = android.graphics.Paint().apply {
-            isAntiAlias = true
-            style = android.graphics.Paint.Style.FILL
-        }
-
-        // Black background
-        canvas.drawColor(android.graphics.Color.BLACK)
-
-        // Draw realistic barbell for 448x448 input
-        paint.color = android.graphics.Color.LTGRAY
-
-        // Bar (horizontal)
-        canvas.drawRect(100f, 210f, 348f, 238f, paint)
-
-        // Weight plates
-        paint.color = android.graphics.Color.GRAY
-        canvas.drawCircle(120f, 224f, 35f, paint)
-        canvas.drawCircle(328f, 224f, 35f, paint)
-
-        // Inner plates
-        paint.color = android.graphics.Color.DKGRAY
-        canvas.drawCircle(120f, 224f, 25f, paint)
-        canvas.drawCircle(328f, 224f, 25f, paint)
-
-        Log.d("OptimizedCamera", "Created optimized test barbell image: 448×448")
-        return bitmap
-    }
-
-    // Optimized drawing function for barbell detections
-    private fun DrawScope.drawOptimizedBarbellDetections(
+    // Drawing function for barbell detections
+    private fun DrawScope.drawBarbellDetections(
         detections: List<Detection>,
         detector: OptimizedBarbellDetector
     ) {
@@ -1141,14 +1034,6 @@ class MainActivity : ComponentActivity() {
                 style = Stroke(width = strokeWidth)
             )
 
-            // Draw quality indicator
-            val qualityColor = color.copy(alpha = 0.3f)
-            drawRect(
-                color = qualityColor,
-                topLeft = Offset(left, top),
-                size = androidx.compose.ui.geometry.Size(right - left, bottom - top)
-            )
-
             // Draw center point
             val centerX = (left + right) / 2f
             val centerY = (top + bottom) / 2f
@@ -1174,7 +1059,6 @@ class MainActivity : ComponentActivity() {
 
                 val confidenceText = "${String.format("%.0f", detection.score * 100)}%"
                 val qualityText = quality.getQualityGrade()
-                val sizeText = "Size: ${String.format("%.3f", quality.size)}"
 
                 // Background for text
                 val backgroundPaint = android.graphics.Paint().apply {
@@ -1185,38 +1069,44 @@ class MainActivity : ComponentActivity() {
                 val textHeight = 20.sp.toPx()
                 val textY = maxOf(top - 10f, textHeight)
 
-                drawRect(left - 5f, textY - textHeight, right + 5f, textY + textHeight * 2, backgroundPaint)
+                drawRect(left - 5f, textY - textHeight, right + 5f, textY + textHeight, backgroundPaint)
 
                 drawText(confidenceText, left + 5f, textY, paint)
-                drawText(qualityText, left + 5f, textY + textHeight, paint)
-                if (top > 80f) {
-                    drawText(sizeText, left + 5f, textY + textHeight * 2, paint)
-                }
-            }
-
-            // Draw aspect ratio indicator
-            val aspectRatio = quality.aspectRatio
-            val isHorizontal = aspectRatio > 1.5f
-            val isVertical = aspectRatio < 0.7f
-
-            if (isHorizontal) {
-                // Draw horizontal indicator
-                drawLine(
-                    color = Color.Cyan,
-                    start = Offset(left + 10f, centerY),
-                    end = Offset(right - 10f, centerY),
-                    strokeWidth = 3.dp.toPx()
-                )
-            } else if (isVertical) {
-                // Draw vertical indicator
-                drawLine(
-                    color = Color.Magenta,
-                    start = Offset(centerX, top + 10f),
-                    end = Offset(centerX, bottom - 10f),
-                    strokeWidth = 3.dp.toPx()
-                )
+                drawText(qualityText, left + 5f, textY + textHeight * 0.7f, paint)
             }
         }
+    }
+
+    // Helper function to create test image for optimized detector
+    private fun createTestBarbell(): Bitmap {
+        val bitmap = Bitmap.createBitmap(448, 448, Bitmap.Config.ARGB_8888)
+        val canvas = Canvas(bitmap)
+        val paint = android.graphics.Paint().apply {
+            isAntiAlias = true
+            style = android.graphics.Paint.Style.FILL
+        }
+
+        // Black background
+        canvas.drawColor(android.graphics.Color.BLACK)
+
+        // Draw realistic barbell for 448x448 input
+        paint.color = android.graphics.Color.LTGRAY
+
+        // Bar (horizontal)
+        canvas.drawRect(100f, 210f, 348f, 238f, paint)
+
+        // Weight plates
+        paint.color = android.graphics.Color.GRAY
+        canvas.drawCircle(120f, 224f, 35f, paint)
+        canvas.drawCircle(328f, 224f, 35f, paint)
+
+        // Inner plates
+        paint.color = android.graphics.Color.DKGRAY
+        canvas.drawCircle(120f, 224f, 25f, paint)
+        canvas.drawCircle(328f, 224f, 25f, paint)
+
+        Log.d("OptimizedCamera", "Created optimized test barbell image: 448×448")
+        return bitmap
     }
 
     // Helper function to convert tracking data to BarPath objects
@@ -1228,6 +1118,277 @@ class MainActivity : ComponentActivity() {
                 barPath.addPoint(PathPoint(dataPoint.x, dataPoint.y, dataPoint.timestamp))
             }
             barPath
+        }
+    }
+
+    // Debug functions
+    private suspend fun runComprehensiveDebug(context: android.content.Context) {
+        withContext(Dispatchers.IO) {
+            try {
+                Log.d("DEBUG", "🔬 Starting comprehensive debug...")
+
+                // Step 1: Check if model file exists
+                Log.d("DEBUG", "📁 Step 1: Checking model file...")
+                val modelExists = checkModelExists(context)
+                Log.d("DEBUG", "Model exists: $modelExists")
+
+                // Step 2: Run model diagnostic
+                Log.d("DEBUG", "🧪 Step 2: Running model diagnostic...")
+                val diagnostic = ModelDiagnostic(context)
+                val result = diagnostic.runComprehensiveDiagnostic()
+
+                val report = diagnostic.generateReport(result)
+                Log.d("DEBUG", "📋 DIAGNOSTIC REPORT:\n$report")
+
+                // Step 3: Test basic TensorFlow Lite functionality
+                Log.d("DEBUG", "⚡ Step 3: Testing basic TFLite...")
+                testBasicTensorFlowLite(context)
+
+                // Step 4: Test with minimal detector
+                Log.d("DEBUG", "🧪 Step 4: Testing minimal detector...")
+                testMinimalDetector(context)
+
+                withContext(Dispatchers.Main) {
+                    Toast.makeText(context, "Debug complete! Check logs for details.", Toast.LENGTH_LONG).show()
+                }
+
+            } catch (e: Exception) {
+                Log.e("DEBUG", "❌ Debug failed: ${e.message}", e)
+                withContext(Dispatchers.Main) {
+                    Toast.makeText(context, "Debug failed: ${e.message}", Toast.LENGTH_LONG).show()
+                }
+            }
+        }
+    }
+
+    private fun checkModelExists(context: android.content.Context): Boolean {
+        return try {
+            val assetManager = context.assets
+            val modelFiles = assetManager.list("") ?: emptyArray()
+
+            Log.d("DEBUG", "📁 Files in assets:")
+            modelFiles.forEach { file ->
+                Log.d("DEBUG", "  - $file")
+            }
+
+            val modelExists = modelFiles.contains("simonskina.tflite")
+            if (modelExists) {
+                // Check file size
+                val fd = assetManager.openFd("simonskina.tflite")
+                val fileSize = fd.length
+                Log.d("DEBUG", "✅ simonskina.tflite found, size: $fileSize bytes")
+                fd.close()
+            } else {
+                Log.e("DEBUG", "❌ simonskina.tflite not found in assets")
+            }
+
+            modelExists
+        } catch (e: Exception) {
+            Log.e("DEBUG", "❌ Error checking model file: ${e.message}", e)
+            false
+        }
+    }
+
+    private fun testBasicTensorFlowLite(context: android.content.Context) {
+        try {
+            Log.d("DEBUG", "⚡ Testing basic TensorFlow Lite...")
+
+            // Test 1: Create a simple interpreter with minimal options
+            val assetFileDescriptor = context.assets.openFd("simonskina.tflite")
+            val inputStream = FileInputStream(assetFileDescriptor.fileDescriptor)
+            val fileChannel = inputStream.channel
+            val startOffset = assetFileDescriptor.startOffset
+            val declaredLength = assetFileDescriptor.declaredLength
+            val modelBuffer = fileChannel.map(FileChannel.MapMode.READ_ONLY, startOffset, declaredLength)
+
+            Log.d("DEBUG", "✅ Model buffer created: ${modelBuffer.capacity()} bytes")
+
+            // Test 2: Try different interpreter options
+            val basicOptions = org.tensorflow.lite.Interpreter.Options()
+            Log.d("DEBUG", "🧪 Testing with basic options...")
+
+            val interpreter1 = try {
+                org.tensorflow.lite.Interpreter(modelBuffer, basicOptions)
+            } catch (e: Exception) {
+                Log.e("DEBUG", "❌ Basic interpreter failed: ${e.message}")
+                null
+            }
+
+            if (interpreter1 != null) {
+                Log.d("DEBUG", "✅ Basic interpreter created successfully")
+                Log.d("DEBUG", "  Input tensors: ${interpreter1.inputTensorCount}")
+                Log.d("DEBUG", "  Output tensors: ${interpreter1.outputTensorCount}")
+
+                // Test input tensor access
+                try {
+                    val inputTensor = interpreter1.getInputTensor(0)
+                    Log.d("DEBUG", "  Input shape: ${inputTensor.shape().contentToString()}")
+                    Log.d("DEBUG", "  Input type: ${inputTensor.dataType()}")
+                } catch (e: Exception) {
+                    Log.e("DEBUG", "❌ Input tensor access failed: ${e.message}")
+                }
+
+                interpreter1.close()
+            }
+
+            // Test 3: Try with single thread
+            val singleThreadOptions = org.tensorflow.lite.Interpreter.Options().apply {
+                setNumThreads(1)
+            }
+
+            val interpreter2 = try {
+                org.tensorflow.lite.Interpreter(modelBuffer, singleThreadOptions)
+            } catch (e: Exception) {
+                Log.e("DEBUG", "❌ Single thread interpreter failed: ${e.message}")
+                null
+            }
+
+            if (interpreter2 != null) {
+                Log.d("DEBUG", "✅ Single thread interpreter created successfully")
+                interpreter2.close()
+            }
+
+        } catch (e: Exception) {
+            Log.e("DEBUG", "❌ Basic TensorFlow Lite test failed: ${e.message}", e)
+        }
+    }
+
+    private fun testMinimalDetector(context: android.content.Context) {
+        try {
+            Log.d("DEBUG", "🧪 Testing minimal detector...")
+
+            val minimalDetector = object {
+                private var interpreter: org.tensorflow.lite.Interpreter? = null
+
+                fun initialize(): Boolean {
+                    return try {
+                        val assetFileDescriptor = context.assets.openFd("simonskina.tflite")
+                        val inputStream = FileInputStream(assetFileDescriptor.fileDescriptor)
+                        val fileChannel = inputStream.channel
+                        val startOffset = assetFileDescriptor.startOffset
+                        val declaredLength = assetFileDescriptor.declaredLength
+                        val modelBuffer = fileChannel.map(FileChannel.MapMode.READ_ONLY, startOffset, declaredLength)
+
+                        interpreter = org.tensorflow.lite.Interpreter(modelBuffer)
+                        Log.d("DEBUG", "✅ Minimal detector initialized")
+                        true
+                    } catch (e: Exception) {
+                        Log.e("DEBUG", "❌ Minimal detector initialization failed: ${e.message}", e)
+                        false
+                    }
+                }
+
+                fun testInference(): Boolean {
+                    return try {
+                        val interp = interpreter ?: return false
+
+                        // Get input specs
+                        val inputTensor = interp.getInputTensor(0)
+                        val inputShape = inputTensor.shape()
+                        val inputSize = inputShape.fold(1) { acc, dim -> acc * dim }
+
+                        // Create dummy input
+                        val inputBuffer = ByteBuffer.allocateDirect(inputSize * 4).apply {
+                            order(ByteOrder.nativeOrder())
+                            repeat(inputSize) { putFloat(0.5f) }
+                            rewind()
+                        }
+
+                        // Create dummy output
+                        val outputArray = Array(1) { Array(100) { FloatArray(6) } }
+
+                        // Run inference
+                        interp.run(inputBuffer, outputArray)
+
+                        Log.d("DEBUG", "✅ Minimal inference test passed")
+                        true
+                    } catch (e: Exception) {
+                        Log.e("DEBUG", "❌ Minimal inference test failed: ${e.message}", e)
+                        false
+                    }
+                }
+
+                fun cleanup() {
+                    interpreter?.close()
+                }
+            }
+
+            val initSuccess = minimalDetector.initialize()
+            if (initSuccess) {
+                val inferenceSuccess = minimalDetector.testInference()
+                Log.d("DEBUG", "Minimal detector inference: ${if (inferenceSuccess) "✅ SUCCESS" else "❌ FAILED"}")
+            }
+
+            minimalDetector.cleanup()
+
+        } catch (e: Exception) {
+            Log.e("DEBUG", "❌ Minimal detector test failed: ${e.message}", e)
+        }
+    }
+
+    private suspend fun checkDependencies(context: android.content.Context) {
+        withContext(Dispatchers.IO) {
+            try {
+                Log.d("DEPS", "📦 Checking TensorFlow Lite dependencies...")
+
+                // Check TensorFlow Lite version
+                try {
+                    val version = org.tensorflow.lite.TensorFlowLite.schemaVersion()
+                    Log.d("DEPS", "✅ TensorFlow Lite schema version: $version")
+                } catch (e: Exception) {
+                    Log.e("DEPS", "❌ Could not get TF Lite version: ${e.message}")
+                }
+
+                // Check if basic TF Lite classes are available
+                val classes = listOf(
+                    "org.tensorflow.lite.Interpreter",
+                    "org.tensorflow.lite.DataType",
+                    "org.tensorflow.lite.Tensor"
+                )
+
+                classes.forEach { className ->
+                    try {
+                        Class.forName(className)
+                        Log.d("DEPS", "✅ Found: $className")
+                    } catch (e: ClassNotFoundException) {
+                        Log.e("DEPS", "❌ Missing: $className")
+                    } catch (e: Exception) {
+                        Log.e("DEPS", "❌ Error loading $className: ${e.message}")
+                    }
+                }
+
+                // Check Android API level
+                val apiLevel = android.os.Build.VERSION.SDK_INT
+                Log.d("DEPS", "📱 Android API Level: $apiLevel")
+
+                if (apiLevel < 26) {
+                    Log.w("DEPS", "⚠️ API level $apiLevel may have limited TF Lite support")
+                } else {
+                    Log.d("DEPS", "✅ API level $apiLevel is good for TF Lite")
+                }
+
+                // Check device architecture
+                val abis = android.os.Build.SUPPORTED_ABIS
+                Log.d("DEPS", "🏗️ Supported ABIs: ${abis.joinToString(", ")}")
+
+                // Check available memory
+                val runtime = Runtime.getRuntime()
+                val maxMemory = runtime.maxMemory() / 1024 / 1024 // MB
+                val totalMemory = runtime.totalMemory() / 1024 / 1024 // MB
+                val freeMemory = runtime.freeMemory() / 1024 / 1024 // MB
+
+                Log.d("DEPS", "💾 Memory - Max: ${maxMemory}MB, Total: ${totalMemory}MB, Free: ${freeMemory}MB")
+
+                withContext(Dispatchers.Main) {
+                    Toast.makeText(context, "Dependencies checked! See logs for details.", Toast.LENGTH_SHORT).show()
+                }
+
+            } catch (e: Exception) {
+                Log.e("DEPS", "❌ Dependency check failed: ${e.message}", e)
+                withContext(Dispatchers.Main) {
+                    Toast.makeText(context, "Dependency check failed: ${e.message}", Toast.LENGTH_LONG).show()
+                }
+            }
         }
     }
 
@@ -1259,14 +1420,14 @@ class MainActivity : ComponentActivity() {
                 )
                 Spacer(modifier = Modifier.height(16.dp))
                 Text(
-                    text = "Optimized Barbell Detector",
+                    text = "Enhanced Barbell Detector",
                     style = MaterialTheme.typography.titleLarge,
                     color = Color.White,
                     textAlign = TextAlign.Center
                 )
                 Spacer(modifier = Modifier.height(8.dp))
                 Text(
-                    text = "EfficientDet-Lite2 • 448×448 • High Precision\nCamera permission required for barbell tracking",
+                    text = "AI-Powered Barbell Tracking\nCamera permission required",
                     style = MaterialTheme.typography.bodyMedium,
                     color = Color.Gray,
                     textAlign = TextAlign.Center
@@ -1330,7 +1491,7 @@ class MainActivity : ComponentActivity() {
                 )
                 Spacer(modifier = Modifier.height(8.dp))
                 Text(
-                    text = "Optimized barbell tracking requires camera access to analyze your lifting form in real-time. Please grant permission in Settings or try again.",
+                    text = "Barbell tracking requires camera access. Please grant permission in Settings or try again.",
                     style = MaterialTheme.typography.bodyMedium,
                     color = Color.Gray,
                     textAlign = TextAlign.Center,
@@ -1363,7 +1524,6 @@ class MainActivity : ComponentActivity() {
 
                     Button(
                         onClick = {
-                            // Open app settings
                             val intent = Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {
                                 data = Uri.fromParts("package", context.packageName, null)
                             }
