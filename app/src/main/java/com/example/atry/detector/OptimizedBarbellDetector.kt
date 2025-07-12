@@ -1,3 +1,6 @@
+// 1. Create OptimizedBarbellDetector.kt in your detector package
+// This is the main file your MainActivity expects
+
 package com.example.atry.detector
 
 import android.content.Context

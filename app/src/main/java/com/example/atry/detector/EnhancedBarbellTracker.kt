@@ -30,7 +30,7 @@ class EnhancedBarbellTracker(
     }
 
     // Use Hybrid Classification Detector instead of Generic TFLite Detector
-    private val detector: HybridClassificationDetector
+    private val detector: OptimizedBarbellDetector
     private val trackingScope = CoroutineScope(Dispatchers.Default)
 
     // Tracking state
@@ -44,7 +44,7 @@ class EnhancedBarbellTracker(
 
     init {
         Log.d(TAG, "🏋️ Initializing Enhanced Barbell Tracker with Hybrid Detector")
-        detector = HybridClassificationDetector(
+        detector = OptimizedBarbellDetector(
             context = context,
             modelPath = modelPath,
             confThreshold = confThreshold,
